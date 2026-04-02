@@ -217,7 +217,7 @@ class CIIParser:
             counts.append(0)
             counts_raw.append("             ")
 
-        self.parsed_data["control"] = {
+        self.parsed_data["control"].update({
             "NUMELT": counts[0],
             "NUMNOZ": counts[1],
             "NOHGRS": counts[2],
@@ -227,7 +227,7 @@ class CIIParser:
             "counts_raw": counts_raw[:6],
             "aux_counts": [],
             "aux_counts_raw": []
-        }
+        })
 
         logger.info(f"[PARSE] #$ CONTROL parsed NUMELT={counts[0]}")
 
