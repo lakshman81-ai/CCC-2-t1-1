@@ -1,0 +1,3208 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CAESAR II Neutral File Tools</title>
+    <!-- TailWind CSS for styling -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/jszip/dist/jszip.min.js"></script>
+    <!-- mdb-reader library (ACCDB parsing, browser-side) -->
+    <script type="module">
+        import Database from "https://cdn.jsdelivr.net/npm/mdb-reader/+esm";
+        import { Buffer } from "https://cdn.jsdelivr.net/npm/buffer/+esm";
+        window.mdbReader = { Database: Database };
+        window.Buffer = Buffer;
+    </script>
+    <!-- Access Import Shared Adapter & Config -->
+    <script>
+        window.onerror = function(msg, src, lineno, colno, err) {
+            console.error('JS Global Error:', msg, err);
+            const detail = {
+                ts: new Date().toISOString(),
+                outcome: 'failure',
+                error: {
+                    message: msg,
+                    rawMessage: err ? err.stack || err.message : msg
+                }
+            };
+            document.dispatchEvent(new CustomEvent('ACCESS_DIAGNOSTICS', { detail }));
+        };
+        window.addEventListener('unhandledrejection', function(e) {
+            console.error('JS Unhandled Rejection:', e.reason);
+            const detail = {
+                ts: new Date().toISOString(),
+                outcome: 'failure',
+                error: {
+                    message: e.reason ? e.reason.message || String(e.reason) : 'Unknown unhandled rejection',
+                    rawMessage: e.reason ? e.reason.stack || String(e.reason) : ''
+                }
+            };
+            document.dispatchEvent(new CustomEvent('ACCESS_DIAGNOSTICS', { detail }));
+        });
+
+        window.ACCESS_IMPORT_CONFIG = {
+            enableServerFallback: true,
+            serverUrl: 'http://127.0.0.1:8000/convert_accdb',
+            defaultTable: 'INPUT_BASIC_ELEMENT_DATA'
+        };
+
+        window.getFallbackMethod = function(logic) {
+            try {
+                const el = document.getElementById(`${logic}-setting-fallback-method`);
+                if (el) return el.value;
+            } catch (e) {}
+            return 'default';
+        };
+
+        window.AccessDiagnostics = {
+            _diagnostics: [],
+            emit: function(diag) {
+                this._diagnostics.unshift(diag);
+                if (this._diagnostics.length > 20) {
+                    this._diagnostics.pop();
+                }
+                document.dispatchEvent(new CustomEvent('ACCESS_DIAGNOSTICS', { detail: diag }));
+                return diag;
+            }
+        };
+
+        const CAESAR_COLS = {
+            from:    ['FROM_NODE', 'FROM', 'FROMNODE', 'NODE_FROM', 'NODEFROM', 'FNODE'],
+            to:      ['TO_NODE',   'TO',   'TONODE',   'NODE_TO',   'NODETO',   'TNODE'],
+            dx:      ['DELTA_X',   'DX',   'DELTAX',   'D_X',  'LENGTH_X', 'X'],
+            dy:      ['DELTA_Y',   'DY',   'DELTAY',   'D_Y',  'LENGTH_Y', 'Y'],
+            dz:      ['DELTA_Z',   'DZ',   'DELTAZ',   'D_Z',  'LENGTH_Z', 'Z'],
+            od:      ['DIAMETER',  'OD',   'OUTSIDE_DIAMETER', 'PIPE_OD', 'PIPE_DIAMETER'],
+            wall:    ['WALL_THICK','WALL', 'WALLTHICK','THICKNESS', 'WALL_THICKNESS', 'WT'],
+            insul:   ['INSUL_THICK','INSULATION','INSUL','INSUL_THICKNESS'],
+            T1:      ['TEMP_EXP_C1','TEMPERATURE1','TEMP1','T1','OPER_TEMP','DESIGN_TEMP'],
+            P1:      ['PRESSURE1', 'PRESSURE','P1','OPER_PRESSURE','DESIGN_PRESSURE'],
+            density: ['PIPE_DENSITY','DENSITY','MATERIAL_DENSITY'],
+            matName: ['MATERIAL_NAME','MATERIAL','MAT_NAME','MATERIAL_NUM'],
+        };
+
+        function matchCol(colNames, key) {
+            const upper = colNames.map(c => c.toUpperCase());
+            const patterns = CAESAR_COLS[key] ?? [];
+            for (const pat of patterns) {
+                const i = upper.indexOf(pat.toUpperCase());
+                if (i >= 0) return colNames[i];
+            }
+            for (const pat of patterns) {
+                const i = upper.findIndex(c => c.includes(pat.toUpperCase()));
+                if (i >= 0) return colNames[i];
+            }
+            return null;
+        }
+
+        function numVal(row, col, fallback = 0) {
+            if (!col) return fallback;
+            const v = parseFloat(row[col]);
+            return isFinite(v) ? v : fallback;
+        }
+
+        window.CSVAdapter = {
+            parse(text) {
+                const lines = text.split(/\r?\n/).filter(l => l.trim() !== '');
+                if (lines.length < 2) return [];
+
+                // Extremely simple RFC4180 parsing for handling quoted fields
+                const parseLine = (line) => {
+                    const result = [];
+                    let start = 0;
+                    let inQuotes = false;
+                    for (let i = 0; i < line.length; i++) {
+                        if (line[i] === '"') {
+                            inQuotes = !inQuotes;
+                        } else if (line[i] === ',' && !inQuotes) {
+                            result.push(line.substring(start, i));
+                            start = i + 1;
+                        }
+                    }
+                    result.push(line.substring(start));
+                    return result.map(c => {
+                        let val = c.trim();
+                        if (val.startsWith('"') && val.endsWith('"')) {
+                            val = val.substring(1, val.length - 1).replace(/""/g, '"');
+                        }
+                        return val;
+                    });
+                };
+
+                const headers = parseLine(lines[0]);
+                const data = [];
+                for (let i = 1; i < lines.length; i++) {
+                    const row = parseLine(lines[i]);
+                    const obj = {};
+                    for (let j = 0; j < headers.length; j++) {
+                        obj[headers[j]] = row[j] !== undefined ? row[j] : '';
+                    }
+                    data.push(obj);
+                }
+                return data;
+            },
+
+            async parseMultiple(files) {
+                const tablesData = {};
+                const tablesList = [];
+                for (let i = 0; i < files.length; i++) {
+                    const file = files[i];
+                    if (!file.name.toLowerCase().endsWith('.csv')) continue;
+
+                    const text = await file.text();
+                    const rows = this.parse(text);
+                    const tableName = file.name.replace(/\.[^/.]+$/, ""); // Remove extension
+
+                    tablesData[tableName] = rows;
+                    tablesList.push(tableName);
+                }
+                return { tablesData, tablesList };
+            }
+        };
+
+        window.AppState = {
+            logic1: {
+                elemRows: null,
+                inputFilename: null
+            },
+            logic2: {
+                tableRows: null,
+                baseCiiText: null,
+                inputFilename: null
+            },
+            logic3: {},
+            logic4: {
+                elemRows: null,
+                bendRows: null,
+                restRows: null,
+                rigidRows: null,
+                sifRows: null,
+                baseCiiText: null,
+                inputFilename: null
+            }
+        };
+
+        window.AccessAdapter = {
+            // Memory trail for diagnostics
+            _diagnostics: [],
+
+            isAccessFile(fileName) {
+                const name = fileName.toLowerCase();
+                return name.endsWith('.accdb') || name.endsWith('.mdb');
+            },
+
+            loadAccessRuntime() {
+                return window.mdbReader && window.Buffer;
+            },
+
+            normalizeAccessError(err) {
+                const errMessage = err.message || '';
+                let code = 'PARSE_FAILED';
+                let message = errMessage || 'An unexpected error occurred while parsing the file.';
+
+                if (errMessage.includes('not supported') || errMessage.includes('format') || errMessage.includes('Wrong page type') || errMessage.includes('completely empty')) {
+                    code = 'ACCESS_UNSUPPORTED';
+                    message = 'This Access format is not supported in browser mode. Use local bridge mode or upload CSV.';
+                } else if (errMessage.includes('table') || errMessage.includes('not found')) {
+                    code = 'TABLE_NOT_FOUND';
+                    message = 'The required table was not found in the database.';
+                } else if (errMessage.includes('Failed to fetch') || errMessage.includes('NetworkError')) {
+                    code = 'SERVER_FAILED';
+                    message = 'Failed to reach the fallback server. Please ensure the server is running or use CSV.';
+                } else if (errMessage.includes('mdb-reader or Buffer not ready')) {
+                    code = 'RUNTIME_NOT_READY';
+                    message = 'Browser parser runtime is not ready.';
+                }
+
+                return {
+                    code,
+                    message,
+                    rawName: err.name || 'Error',
+                    rawMessage: errMessage.substring(0, 200),
+                    stackTop: err.stack ? err.stack.split('\n')[1] || '' : ''
+                };
+            },
+
+            _emitDiagnostic(data) {
+                const ts = new Date().toISOString();
+                const diag = { ts, ...data };
+                this._diagnostics.unshift(diag);
+                if (this._diagnostics.length > 20) {
+                    this._diagnostics.pop();
+                }
+                // Dispatch event so UI can update
+                document.dispatchEvent(new CustomEvent('ACCESS_DIAGNOSTICS', { detail: diag }));
+                return diag;
+            },
+
+            async parseAccessTables(fileBuffer, options, fileInfo, logic, statusCallback, cachedData) {
+                const updateStatus = (msg) => {
+                    if (statusCallback) statusCallback(msg);
+                };
+
+                if (!this.hasAccessMagicHeader(fileBuffer) && this.isLikelyXmlMislabelledAsAccess(fileBuffer)) {
+                    throw new Error('Selected file has .accdb extension but appears to be XML. Please upload the actual Access database (.accdb) or import this file as XML/CII instead.');
+                }
+
+                updateStatus('loading runtime');
+                const ext = fileInfo.name.slice(fileInfo.name.lastIndexOf('.')).toLowerCase();
+                const fileSizeBytes = fileInfo.size;
+                const traceId = Math.random().toString(36).substring(2, 9);
+                const selectedTable = options.tables ? options.tables.join(',') : (options.tableName || window.ACCESS_IMPORT_CONFIG.defaultTable);
+
+                let diagBase = {
+                    traceId,
+                    logic,
+                    fileName: fileInfo.name,
+                    fileExt: ext,
+                    fileSizeBytes,
+                    runtime: {
+                        mdbReaderReady: !!window.mdbReader,
+                        bufferReady: !!window.Buffer,
+                        pyscriptReady: !!document.querySelector('py-config')
+                    },
+                    selectedTable: selectedTable,
+                    availableTables: [],
+                    strategy: 'browser',
+                    perf: { readMs: 0, parseMs: 0, totalMs: 0 }
+                };
+
+                const startTotal = performance.now();
+                let tablesData = {};
+
+                // Use cached data if available (e.g. from server fallback during metadata fetch)
+                if (cachedData) {
+                    if (options.tables) {
+                        for (let tn of options.tables) {
+                            tablesData[tn] = cachedData[tn] || [];
+                        }
+                    } else {
+                        const targetTable = options.tableName || window.ACCESS_IMPORT_CONFIG.defaultTable;
+                        if (!cachedData[targetTable]) {
+                            throw new Error(`Table ${targetTable} not found in cached data`);
+                        }
+                        tablesData[targetTable] = cachedData[targetTable];
+                    }
+                    diagBase.strategy = 'server-fallback';
+                    diagBase.availableTables = Object.keys(cachedData);
+                    diagBase.perf.totalMs = Math.round(performance.now() - startTotal);
+                    window.AccessDiagnostics.emit({ ...diagBase, outcome: 'success', error: null });
+                    updateStatus('table resolved');
+                    return { tablesData, tablesList: diagBase.availableTables, diag: diagBase };
+                }
+
+                // Strategy 1: Browser Parser
+                updateStatus('reading file');
+                if (this.loadAccessRuntime()) {
+                    try {
+                        updateStatus('parsing');
+                        const startParse = performance.now();
+                        const { Database } = window.mdbReader;
+                        const db = new Database(window.Buffer.from(fileBuffer));
+                        const availableTables = db.getTableNames();
+                        diagBase.availableTables = availableTables;
+
+                        // Strategy A: look for embedded CAESAR II neutral/XML text (from method -1 fallback)
+                        if (!options.tables || options.tables.length === 1) {
+                            let embeddedText = null;
+                            for (const name of availableTables) {
+                                try {
+                                    const table = db.getTable(name);
+                                    const cols = table.getColumnNames();
+                                    const rows = table.getData();
+                                    for (const col of cols) {
+                                        for (const row of rows.slice(0, 10)) {
+                                            const val = row[col];
+                                            if (typeof val === 'string' && val.length > 200) {
+                                                if (/^#\$\s*(VERSION|ELEMENTS|CONTROL)/m.test(val)) {
+                                                    embeddedText = val;
+                                                    break;
+                                                }
+                                                if (val.includes('<CAESARII') || val.includes('<PIPINGMODEL')) {
+                                                    embeddedText = val;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        if (embeddedText) break;
+                                    }
+                                } catch (e) {}
+                                if (embeddedText) break;
+                            }
+                            if (embeddedText) {
+                                window.AppState[options.logic].baseCiiText = embeddedText;
+                                diagBase.strategy = 'embedded-text';
+                                diagBase.perf.parseMs = Math.round(performance.now() - startParse);
+                                diagBase.perf.totalMs = Math.round(performance.now() - startTotal);
+                                window.AccessDiagnostics.emit({ ...diagBase, outcome: 'success', error: null });
+                                updateStatus('embedded text resolved');
+                                return { tablesData: {}, tablesList: availableTables, diag: diagBase };
+                            }
+                        }
+
+                        const tablesToExtract = options.tables ? options.tables : [options.tableName || window.ACCESS_IMPORT_CONFIG.defaultTable];
+
+                        for (const tableName of tablesToExtract) {
+                            if (!availableTables.includes(tableName)) {
+                                // Table does not exist, that can be normal for some aux tables
+                                tablesData[tableName] = [];
+                            } else {
+                                // Table exists, but if getTable or getData fails, we MUST throw
+                                // to trigger the Strategy 2 (Server Fallback)
+                                const table = db.getTable(tableName);
+                                tablesData[tableName] = table.getData();
+
+                                // mdb-reader sometimes silently fails to read data pages of newer .accdb files
+                                // and returns an empty array. We should throw if the primary element table is empty.
+                                if (tableName === window.ACCESS_IMPORT_CONFIG.defaultTable && tablesData[tableName].length === 0) {
+                                    throw new Error("Parsed primary element table was completely empty. This may be an unsupported Access format.");
+                                }
+                            }
+                        }
+
+                        const endParse = performance.now();
+                        diagBase.perf.parseMs = Math.round(endParse - startParse);
+                        diagBase.perf.totalMs = Math.round(endParse - startTotal);
+
+                        window.AccessDiagnostics.emit({
+                            ...diagBase,
+                            outcome: 'success',
+                            error: null
+                        });
+
+                        updateStatus('table resolved');
+                        return { tablesData, tablesList: diagBase.availableTables, diag: diagBase };
+                    } catch (e) {
+                        // Strategy B: Fuzzy column match (if strict extraction failed or returned 0 rows)
+                        try {
+                            const { Database } = window.mdbReader;
+                            const db = new Database(window.Buffer.from(fileBuffer));
+                            const tableNamesFromDb = db.getTableNames();
+                            for (const tname of tableNamesFromDb) {
+                                try {
+                                    const table = db.getTable(tname);
+                                    const cols = table.getColumnNames();
+
+                                    const fromCol = matchCol(cols, 'from');
+                                    const toCol   = matchCol(cols, 'to');
+                                    const odCol   = matchCol(cols, 'od');
+                                    const dxCol   = matchCol(cols, 'dx');
+                                    const dyCol   = matchCol(cols, 'dy');
+                                    const dzCol   = matchCol(cols, 'dz');
+
+                                    if (!fromCol || !toCol || (!odCol && !dxCol)) continue;
+
+                                    const wallCol  = matchCol(cols, 'wall');
+                                    const insulCol = matchCol(cols, 'insul');
+                                    const t1Col    = matchCol(cols, 'T1');
+                                    const p1Col    = matchCol(cols, 'P1');
+                                    const densCol  = matchCol(cols, 'density');
+                                    const matCol   = matchCol(cols, 'matName');
+
+                                    const rows = table.getData();
+                                    const extractedRows = [];
+
+                                    let pOd = 0, pWall = 0, pInsul = 0, pT1 = 0, pP1 = 0, pDens = 7.833e-3, pMat = 'CS';
+
+                                    for (let i = 0; i < rows.length; i++) {
+                                        const row = rows[i];
+                                        const from = parseInt(row[fromCol]) || 0;
+                                        const to   = parseInt(row[toCol])   || 0;
+                                        if (!from || !to || from === to) continue;
+
+                                        const dx = numVal(row, dxCol);
+                                        const dy = numVal(row, dyCol);
+                                        const dz = numVal(row, dzCol);
+
+                                        const rawOd = numVal(row, odCol);
+                                        const od    = rawOd > 0 ? rawOd : pOd;
+
+                                        const wall     = numVal(row, wallCol,  pWall)  || pWall;
+                                        const insul    = numVal(row, insulCol, pInsul) || pInsul;
+                                        const T1       = numVal(row, t1Col,    pT1)    || pT1;
+                                        const P1       = numVal(row, p1Col,    pP1)    || pP1;
+                                        const density  = numVal(row, densCol,  pDens)  || pDens;
+                                        const material = (matCol && row[matCol]) ? String(row[matCol]).trim() : pMat;
+
+                                        pOd = od || pOd;  pWall = wall || pWall;  pInsul = insul || pInsul;
+                                        pT1  = T1 || pT1; pP1   = P1  || pP1;    pDens  = density || pDens;
+                                        pMat = material || pMat;
+
+                                        extractedRows.push({
+                                            'FROM_NODE': from, 'TO_NODE': to,
+                                            'DELTA_X': dx, 'DELTA_Y': dy, 'DELTA_Z': dz,
+                                            'DIAMETER': od, 'WALL_THICK': wall, 'INSULATION': insul,
+                                            'TEMP_EXP_C1': T1, 'PRESSURE1': P1,
+                                            'PIPE_DENSITY': density, 'MATERIAL_NAME': material,
+                                            'BEND_PTR': '', 'REST_PTR': '', 'RIGID_PTR': '', 'INT_PTR': ''
+                                        });
+                                    }
+
+                                    if (extractedRows.length > 0) {
+                                        tablesData[window.ACCESS_IMPORT_CONFIG.defaultTable] = extractedRows;
+                                        if (options.tables) {
+                                            for (let tn of options.tables) {
+                                                if (tn !== window.ACCESS_IMPORT_CONFIG.defaultTable) {
+                                                    tablesData[tn] = [];
+                                                }
+                                            }
+                                        }
+                                        window.AccessDiagnostics.emit({ ...diagBase, outcome: 'success', error: null, strategy: 'browser-fuzzy' });
+                                        updateStatus('table resolved via fuzzy match');
+                                        return { tablesData, tablesList: diagBase.availableTables, diag: diagBase };
+                                    }
+                                } catch (fuzzyErr) { }
+                            }
+                        } catch (errWrapper) {}
+
+                        // Browser parse failed, prepare for Strategy 2/3
+                        const normErr = this.normalizeAccessError(e);
+                        diagBase.error = {
+                            code: normErr.code,
+                            message: normErr.message,
+                            rawName: e.name,
+                            rawMessage: (e.message || '').substring(0, 100),
+                            stackTop: e.stack ? e.stack.split('\n')[1] : ''
+                        };
+
+                        // Strategy 2: Server Fallback (if enabled)
+                        if (window.ACCESS_IMPORT_CONFIG.enableServerFallback) {
+                            updateStatus('falling back to server parse...');
+                            diagBase.strategy = 'server-fallback';
+
+                            try {
+                                const formData = new FormData();
+                                formData.append('file', new Blob([fileBuffer]), fileInfo.name);
+                                if (options.tables) {
+                                    formData.append('tables', options.tables.join(','));
+                                } else {
+                                    formData.append('table', options.tableName || window.ACCESS_IMPORT_CONFIG.defaultTable);
+                                }
+                                formData.append('method', window.getFallbackMethod(logic));
+
+                                const response = await fetch(window.ACCESS_IMPORT_CONFIG.serverUrl, {
+                                    method: 'POST',
+                                    body: formData
+                                });
+
+                                if (!response.ok) {
+                                    throw new Error(`Server returned status ${response.status}`);
+                                }
+
+                                const serverData = await response.json();
+
+                                diagBase.perf.totalMs = Math.round(performance.now() - startTotal);
+                                window.AccessDiagnostics.emit({ ...diagBase, outcome: 'success', error: null });
+                                updateStatus('table resolved via server');
+
+                                // Re-wrap to maintain expected return payload
+                                tablesData = serverData.tablesData || serverData;
+                                if (!options.tables) {
+                                    tablesData = { [options.tableName || window.ACCESS_IMPORT_CONFIG.defaultTable]: serverData };
+                                }
+                                return { tablesData, tablesList: serverData.availableTables || Object.keys(tablesData), diag: diagBase };
+
+                            } catch (serverErr) {
+                                // Fallback server failed -> Strategy 3
+                                diagBase.error = {
+                                    code: 'SERVER_FAILED',
+                                    message: 'Failed to reach the fallback server. Is it running?',
+                                    rawName: serverErr.name,
+                                    rawMessage: (serverErr.message || '').substring(0, 100),
+                                    stackTop: serverErr.stack ? serverErr.stack.split('\n')[1] : ''
+                                };
+
+                                // Explicitly match user requested behavior of chaining messages
+                                diagBase.error.message = `Browser parse failed (${normErr.message}). Fallback server also failed: ${diagBase.error.message}`;
+
+                                window.AccessDiagnostics.emit({ ...diagBase, outcome: 'failure' });
+                                updateStatus('server parse failed');
+                                throw new Error(diagBase.error.message + " Please use CSV instead.");
+                            }
+
+                        } else {
+                            // Strategy 3: Guided CSV path
+                            diagBase.strategy = 'csv-guidance';
+                            window.AccessDiagnostics.emit({ ...diagBase, outcome: 'failure' });
+                            updateStatus('browser parse failed');
+                            throw new Error(normErr.message + " Please use CSV instead.");
+                        }
+                    }
+                } else {
+                    diagBase.error = {
+                        code: 'RUNTIME_NOT_READY',
+                        message: 'Browser parser not loaded.',
+                        rawName: 'Error',
+                        rawMessage: 'mdbReader or Buffer missing',
+                        stackTop: ''
+                    };
+                    diagBase.strategy = 'csv-guidance';
+                    diagBase.perf.totalMs = Math.round(performance.now() - startTotal);
+                    window.AccessDiagnostics.emit({ ...diagBase, outcome: 'failure' });
+                    updateStatus('runtime not loaded');
+                    throw new Error("Access tools not loaded. Please refresh or use CSV.");
+                }
+            },
+
+            hasAccessMagicHeader(arrayBuffer) {
+                if (!arrayBuffer || arrayBuffer.byteLength < 16) return false;
+                const bytes = new Uint8Array(arrayBuffer, 0, 16);
+                const accessSig = [0x00, 0x01, 0x00, 0x00, 0x53, 0x74, 0x61, 0x6e, 0x64, 0x61, 0x72, 0x64, 0x20, 0x41, 0x43, 0x45];
+                for (let i = 0; i < accessSig.length; i++) {
+                    if (bytes[i] !== accessSig[i]) return false;
+                }
+                return true;
+            },
+
+            isLikelyXmlMislabelledAsAccess(arrayBuffer) {
+                if (!arrayBuffer || arrayBuffer.byteLength < 5) return false;
+                const sampleLen = Math.min(arrayBuffer.byteLength, 256);
+                const bytes = new Uint8Array(arrayBuffer, 0, sampleLen);
+                const asText = String.fromCharCode(...bytes).trimStart().toLowerCase();
+                return asText.startsWith('<') && (asText.startsWith('<?xml') || asText.startsWith('<caesarii') || asText.startsWith('<pipingmodel'));
+            },
+
+            async readTableNames(arrayBuffer, fileInfo, logic, statusCallback) {
+                if (statusCallback) statusCallback('loading runtime');
+                const t0 = performance.now();
+                const traceId = Math.random().toString(36).substring(2, 9);
+                const diag = {
+                    traceId: traceId,
+                    ts: new Date().toISOString(),
+                    logic: logic,
+                    fileName: fileInfo.name,
+                    fileExt: fileInfo.name.substring(fileInfo.name.lastIndexOf('.')),
+                    fileSizeBytes: fileInfo.size,
+                    runtime: {
+                        mdbReaderReady: !!window.mdbReader,
+                        bufferReady: !!window.Buffer,
+                        pyscriptReady: !!document.querySelector('py-config')
+                    },
+                    strategy: 'browser',
+                    selectedTable: null,
+                    availableTables: [],
+                    outcome: 'failure',
+                    perf: { readMs: 0, parseMs: 0, totalMs: 0 }
+                };
+
+                let fallbackServerRequired = false;
+                let fallbackError = null;
+
+                if (!this.hasAccessMagicHeader(arrayBuffer) && this.isLikelyXmlMislabelledAsAccess(arrayBuffer)) {
+                    throw new Error('Selected file has .accdb extension but appears to be XML. Please upload the actual Access database (.accdb) or import this file as XML/CII instead.');
+                }
+
+                if (!this.loadAccessRuntime()) {
+                    fallbackServerRequired = true;
+                    fallbackError = new Error("mdb-reader or Buffer not ready");
+                } else {
+                    try {
+                        if (statusCallback) statusCallback('reading file');
+                        const { Database } = window.mdbReader;
+                        const db = new Database(window.Buffer.from(arrayBuffer));
+
+                        if (statusCallback) statusCallback('parsing');
+                        diag.availableTables = db.getTableNames();
+
+                        const t1 = performance.now();
+                        diag.perf.readMs = Math.round(t1 - t0);
+                        diag.perf.totalMs = Math.round(t1 - t0);
+                        diag.outcome = 'success';
+                        if (statusCallback) statusCallback('table resolved');
+
+                        // We do not emit diag here for just reading table names to avoid spamming the log
+                        return { tablesList: diag.availableTables, diag };
+                    } catch (err) {
+                        fallbackServerRequired = true;
+                        fallbackError = err;
+                    }
+                }
+
+                if (fallbackServerRequired) {
+                    if (window.ACCESS_IMPORT_CONFIG.enableServerFallback) {
+                        diag.strategy = 'server-fallback';
+                        try {
+                            if (statusCallback) statusCallback('reading file (server)');
+                            const formData = new FormData();
+                            formData.append('file', new Blob([arrayBuffer]), fileInfo.name);
+                            formData.append('table', window.ACCESS_IMPORT_CONFIG.defaultTable); // Just to get metadata
+                            formData.append('method', window.getFallbackMethod(logic));
+
+                            const response = await fetch(window.ACCESS_IMPORT_CONFIG.serverUrl, {
+                                method: 'POST',
+                                body: formData
+                            });
+
+                            if (!response.ok) {
+                                throw new Error(`Server returned ${response.status}: ${response.statusText}`);
+                            }
+
+                            if (statusCallback) statusCallback('parsing (server)');
+                            const data = await response.json();
+
+                            diag.availableTables = data.availableTables || (data.tablesData ? Object.keys(data.tablesData) : []);
+                            if (!diag.availableTables.length && data.data) {
+                                diag.availableTables = [window.ACCESS_IMPORT_CONFIG.defaultTable];
+                            }
+
+                            diag.outcome = 'success';
+                            diag.perf.totalMs = Math.round(performance.now() - t0);
+                            if (statusCallback) statusCallback('table resolved');
+
+                            // We emit here because it hit fallback, useful to know metadata fetch used fallback
+                            window.AccessDiagnostics.emit(diag);
+                            return { tablesList: diag.availableTables, diag, cachedData: data.tablesData || { [window.ACCESS_IMPORT_CONFIG.defaultTable]: data.data } };
+
+                        } catch (serverErr) {
+                            diag.strategy = 'csv-guidance';
+                            diag.error = this.normalizeAccessError(serverErr);
+                            if (fallbackError) {
+                                diag.error.message = `Browser parse failed (${fallbackError.message}). Fallback server also failed: ${diag.error.message}`;
+                            }
+                            diag.outcome = 'failure';
+                            window.AccessDiagnostics.emit(diag);
+                            throw new Error(diag.error.message);
+                        }
+                    } else {
+                        diag.strategy = 'csv-guidance';
+                        diag.error = this.normalizeAccessError(fallbackError);
+                        diag.outcome = 'failure';
+                        window.AccessDiagnostics.emit(diag);
+                        throw new Error(diag.error.message);
+                    }
+                }
+            }
+        };
+    </script>
+    <!-- PyScript -->
+    <link rel="stylesheet" href="https://pyscript.net/releases/2024.1.1/core.css" />
+    <script type="module" src="https://pyscript.net/releases/2024.1.1/core.js"></script>
+    <!-- Logic 3 Core JS Files -->
+    <script src="benchmark_data.js"></script>
+    <script src="format_funcs.js"></script>
+    <script src="generate_final.js"></script>
+</head>
+<body class="bg-gray-100 font-sans text-gray-800">
+
+<div class="max-w-5xl mx-auto mt-10 p-6 bg-white rounded-lg shadow-md">
+    <h1 class="text-3xl font-bold mb-6 text-center text-blue-600">CAESAR II Neutral File Tools</h1>
+
+    <div id="loading" class="text-center p-4 text-blue-500 font-semibold">
+        Loading Python Environment... Please wait.
+    </div>
+
+    <div id="app" class="hidden">
+
+        <!-- ===== Logic Selector Dropdown ===== -->
+        <div class="flex items-center gap-4 mb-5 p-3 bg-blue-50 border border-blue-200 rounded-lg">
+            <label class="text-sm font-semibold text-blue-800 whitespace-nowrap">Generation Logic:</label>
+            <select id="logic-dropdown" class="border border-blue-300 rounded p-1.5 text-sm flex-1 max-w-xs bg-white"
+                    onchange="switchMainTab('tab-' + this.value)">
+                <option value="logic1">Logic 1 — Standalone CII (Python)</option>
+                <option value="logic2">Logic 2 — ACCDB/CII Merge (Python)</option>
+                <option value="logic3" selected>Logic 3 — ACCDB / CSV → CII (JS)</option>
+                <option value="logic4">Logic 4 — Hybrid (Multi-Table + Full Aux)</option>
+            </select>
+            <button onclick="switchMainTab('tab-accdb-tools')"
+                    class="text-sm text-blue-700 underline hover:text-blue-900 whitespace-nowrap mr-2">Access &#8594; CSV</button>
+            <button onclick="switchMainTab('tab-cii-tools')"
+                    class="text-sm text-blue-700 underline hover:text-blue-900 whitespace-nowrap">CII Format Fixer</button>
+        </div>
+
+        <!-- ===== Main Tab Bar ===== -->
+        <div class="flex border-b border-gray-300 mb-5 gap-0">
+            <button id="tab-btn-logic1"
+                    class="main-tab-btn px-5 py-2 text-sm font-medium border-b-2 border-transparent text-gray-500 hover:text-gray-800 hover:border-gray-400"
+                    onclick="switchMainTab('tab-logic1')">Logic 1</button>
+            <button id="tab-btn-logic2"
+                    class="main-tab-btn px-5 py-2 text-sm font-medium border-b-2 border-transparent text-gray-500 hover:text-gray-800 hover:border-gray-400"
+                    onclick="switchMainTab('tab-logic2')">Logic 2</button>
+            <button id="tab-btn-logic3"
+                    class="main-tab-btn px-5 py-2 text-sm font-medium border-b-2 border-blue-600 text-blue-600"
+                    onclick="switchMainTab('tab-logic3')">Logic 3</button>
+            <button id="tab-btn-logic4"
+                    class="main-tab-btn px-5 py-2 text-sm font-medium border-b-2 border-transparent text-gray-500 hover:text-gray-800 hover:border-gray-400"
+                    onclick="switchMainTab('tab-logic4')">Logic 4 &#9889;</button>
+            <button id="tab-btn-accdb-tools"
+                    class="main-tab-btn px-5 py-2 text-sm font-medium border-b-2 border-transparent text-gray-500 hover:text-gray-800 hover:border-gray-400"
+                    onclick="switchMainTab('tab-accdb-tools')">Access &#8594; CSV</button>
+            <button id="tab-btn-cii-tools"
+                    class="main-tab-btn px-5 py-2 text-sm font-medium border-b-2 border-transparent text-gray-500 hover:text-gray-800 hover:border-gray-400"
+                    onclick="switchMainTab('tab-cii-tools')">CII Format Fixer</button>
+        </div>
+
+        <!-- ================================================================ -->
+        <!-- ===== LOGIC 1 TAB ===== -->
+        <!-- ================================================================ -->
+        <div id="tab-logic1" class="main-tab-panel hidden">
+            <div class="p-3 bg-slate-50 border border-slate-200 rounded-lg mb-4">
+                <p class="text-slate-800 font-semibold text-sm">Logic 1 &mdash; Standalone CII Generator (Python)</p>
+                <p class="text-slate-600 text-xs mt-1">
+                    Generates a CAESAR II .CII file directly from ACCDB or universal CSV.
+                    Uses <code class="bg-slate-100 px-1 rounded">Logic1_export_cii.CaesarExporter.from_tables()</code> &mdash;
+                    all processing in PyScript, no server required.
+                </p>
+            </div>
+
+            <!-- Logic 1 Sub-tabs -->
+            <div class="flex gap-2 mb-4">
+                <button id="l1-btn-processing"
+                        class="l1-btn px-3 py-1.5 text-sm rounded bg-slate-600 text-white font-medium"
+                        onclick="switchSubTab('l1','processing')">Processing</button>
+                <button id="l1-btn-intermediate"
+                        class="l1-btn px-3 py-1.5 text-sm rounded bg-white border border-gray-300 text-gray-500"
+                        onclick="switchSubTab('l1','intermediate')">Intermediate Output</button>
+                <button id="l1-btn-settings"
+                        class="l1-btn px-3 py-1.5 text-sm rounded bg-white border border-gray-300 text-gray-500"
+                        onclick="switchSubTab('l1','settings')">Settings</button>
+                <button id="l1-btn-debug"
+                        class="l1-btn px-3 py-1.5 text-sm rounded bg-white border border-gray-300 text-gray-500"
+                        onclick="switchSubTab('l1','debug')">&#128269; Debug</button>
+            </div>
+
+            <!-- Logic 1: Processing -->
+            <div id="l1-processing" class="l1-panel border border-gray-200 rounded-lg p-5 bg-gray-50">
+                <h3 class="text-sm font-semibold mb-3 text-gray-700">Output / Processing &mdash; Convert to .CII</h3>
+                <div class="flex flex-col gap-4">
+                    <div>
+                        <label class="block text-sm font-medium mb-1">Select Input File(s) (.accdb, .mdb, or multiple .csv files)</label>
+                        <input type="file" id="l1-upload" accept=".accdb,.mdb,.csv" multiple
+                               class="block w-full border border-gray-300 p-2 rounded text-sm bg-white">
+                        <p class="text-xs text-gray-500 mt-1">ACCDB: extracts INPUT_BASIC_ELEMENT_DATA automatically. CSV: Select a single Universal CSV or multiple individual CSVs.</p>
+                    </div>
+                    <div id="l1-table-status" class="hidden p-2 bg-slate-100 rounded text-xs text-slate-700"></div>
+                    <div class="flex gap-3 items-center flex-wrap">
+                        <button id="l1-btn-convert"
+                                class="bg-slate-600 text-white px-4 py-2 rounded hover:bg-slate-700 text-sm font-medium">
+                            Convert &amp; Download .CII
+                        </button>
+                        <span id="l1-status-processing" class="text-xs text-gray-500"></span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Logic 1: Intermediate Output -->
+            <div id="l1-intermediate" class="l1-panel hidden border border-gray-200 rounded-lg p-5 bg-gray-50">
+                <h3 class="text-sm font-semibold mb-3 text-gray-700">Intermediate Output &mdash; Export Logic 1 CSV</h3>
+                <p class="text-sm text-gray-600 mb-4">Exports the 41-column Logic 1 CSV from the last conversion.</p>
+                <div class="flex gap-3 items-center flex-wrap">
+                    <button id="l1-btn-export-intermediate"
+                            class="bg-indigo-600 text-white px-4 py-2 rounded hover:bg-indigo-700 text-sm font-medium">
+                        Export Intermediate CSV
+                    </button>
+                    <span id="l1-status-intermediate" class="text-xs text-gray-500"></span>
+                </div>
+                <div id="l1-csv-preview-container" class="hidden mt-4">
+                    <label class="block text-sm font-medium mb-1 text-gray-700">CSV Preview (first 5 rows):</label>
+                    <pre id="l1-csv-preview"
+                         class="bg-gray-800 text-green-400 p-3 rounded text-xs overflow-x-auto max-h-48 whitespace-pre"></pre>
+                </div>
+            </div>
+
+            <!-- Logic 1: Settings -->
+            <div id="l1-settings" class="l1-panel hidden border border-gray-200 rounded-lg p-5 bg-gray-50">
+                <h3 class="text-sm font-semibold mb-3 text-gray-700">Logic 1 Settings</h3>
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-5">
+                    <div>
+                        <label class="block text-xs font-semibold text-gray-600 mb-1">CAESAR II Auto-Calc Sentinel</label>
+                        <input type="number" id="l1-setting-sentinel" step="0.0001" value="-1.0101"
+                               class="w-full border border-gray-300 p-1.5 rounded text-sm bg-white">
+                        <p class="text-xs text-gray-400 mt-0.5">Value CAESAR uses to flag auto-calculated records.</p>
+                    </div>
+                    <div>
+                        <label class="block text-xs font-semibold text-gray-600 mb-1">DOS Newlines (CRLF)</label>
+                        <select id="l1-setting-crlf" class="w-full border border-gray-300 p-1.5 rounded text-sm bg-white">
+                            <option value="true" selected>Yes &mdash; Windows/CAESAR II standard</option>
+                            <option value="false">No &mdash; Unix (LF only)</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="block text-xs font-semibold text-gray-600 mb-1">Server Fallback Parser Method</label>
+                        <select id="l1-setting-fallback-method" class="w-full border border-gray-300 p-1.5 rounded text-sm bg-white">
+                            <option value="default" selected>Method 1 (Fuzzy/Embedded CAESAR II text)</option>
+                            <option value="ms-access-to-csv">Method 2 (ms-access-to-csv / C#)</option>
+                            <option value="accdbexport">Method 3 (accdbexport / R Jackcess)</option>
+                        </select>
+                        <p class="text-xs text-gray-400 mt-0.5">Parser used by local server fallback.</p>
+                    </div>
+                </div>
+                <button id="l1-btn-apply-settings"
+                        class="bg-slate-600 text-white px-4 py-2 rounded hover:bg-slate-700 text-sm font-medium">
+                    Apply Settings
+                </button>
+                <span id="l1-status-settings" class="text-xs text-gray-500 ml-3"></span>
+            </div>
+
+            <!-- Logic 1: Debug -->
+            <div id="l1-debug" class="l1-panel hidden border border-orange-200 rounded-lg p-5 bg-orange-50">
+                <h3 class="text-sm font-semibold mb-3 text-orange-800">&#128269; Debug Inspector &mdash; Logic 1</h3>
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-3">
+                    <div class="border border-orange-100 rounded p-3 bg-white">
+                        <p class="text-xs font-bold text-orange-700 mb-2 uppercase tracking-wide">JS Global State</p>
+                        <button class="text-xs bg-orange-500 text-white px-3 py-1.5 rounded hover:bg-orange-600 font-medium mb-1"
+                                onclick="_l1_inspectJS()">Inspect JS Globals</button>
+                        <pre id="l1-debug-js-out" class="bg-gray-900 text-green-400 p-2 rounded text-xs overflow-auto max-h-56 whitespace-pre min-h-8 mt-1 font-mono"></pre>
+                    </div>
+                    <div class="border border-orange-100 rounded p-3 bg-white">
+                        <p class="text-xs font-bold text-orange-700 mb-2 uppercase tracking-wide">Python State</p>
+                        <button class="text-xs bg-orange-700 text-white px-3 py-1.5 rounded hover:bg-orange-800 font-medium mb-2"
+                                onclick="document.dispatchEvent(new CustomEvent('l1-debug'))">Inspect Python State</button>
+                        <p class="text-xs text-gray-500 mt-1">Output appears in Operation Logs &darr;</p>
+                    </div>
+                </div>
+                <button onclick="document.getElementById('l1-debug-js-out').textContent=''"
+                        class="text-xs bg-gray-200 hover:bg-gray-300 text-gray-700 px-2 py-1 rounded border border-gray-300">Clear JS Output</button>
+            </div>
+        </div>
+
+        <!-- ================================================================ -->
+        <!-- ===== LOGIC 2 TAB ===== -->
+        <!-- ================================================================ -->
+        <div id="tab-logic2" class="main-tab-panel hidden">
+            <div class="p-3 bg-teal-50 border border-teal-200 rounded-lg mb-4">
+                <p class="text-teal-800 font-semibold text-sm">Logic 2 — ACCDB / CII → Round-trip CII (Python Pipeline)</p>
+                <p class="text-teal-700 text-xs mt-1">
+                    Parses ACCDB element data via mdb-reader, merges into a CAESAR II skeleton, and serialises
+                    to a valid .CII file. Optionally provide an original .CII as the merge base.
+                    Core: <code class="bg-teal-100 px-1 rounded">Logic2_importer</code> →
+                    <code class="bg-teal-100 px-1 rounded">Logic2_serializer</code>.
+                </p>
+            </div>
+
+            <!-- Logic 2 Sub-tabs -->
+            <div class="flex gap-2 mb-4">
+                <button id="l2-btn-processing"
+                        class="l2-btn px-3 py-1.5 text-sm rounded bg-teal-600 text-white font-medium"
+                        onclick="switchSubTab('l2','processing')">Processing</button>
+                <button id="l2-btn-intermediate"
+                        class="l2-btn px-3 py-1.5 text-sm rounded bg-white border border-gray-300 text-gray-500"
+                        onclick="switchSubTab('l2','intermediate')">Intermediate Output</button>
+                <button id="l2-btn-settings"
+                        class="l2-btn px-3 py-1.5 text-sm rounded bg-white border border-gray-300 text-gray-500"
+                        onclick="switchSubTab('l2','settings')">Settings</button>
+                <button id="l2-btn-debug"
+                        class="l2-btn px-3 py-1.5 text-sm rounded bg-white border border-gray-300 text-gray-500"
+                        onclick="switchSubTab('l2','debug')">&#128269; Debug</button>
+            </div>
+
+            <!-- Logic 2: Processing -->
+            <div id="l2-processing" class="l2-panel border border-gray-200 rounded-lg p-5 bg-gray-50">
+                <h3 class="text-sm font-semibold mb-3 text-gray-700">Output / Processing — Convert to .CII</h3>
+                <div class="flex flex-col gap-4">
+                    <div>
+                        <label class="block text-sm font-medium mb-1">Select Input File(s) (.accdb, .mdb, or multiple .csv files)</label>
+                        <input type="file" id="l2-upload" accept=".accdb,.mdb,.csv" multiple
+                               class="block w-full border border-gray-300 p-2 rounded text-sm bg-white">
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium mb-1">Base .CII File (optional — for merge mode)</label>
+                        <input type="file" id="l2-upload-cii" accept=".cii"
+                               class="block w-full border border-gray-300 p-2 rounded text-sm bg-white">
+                        <p class="text-xs text-gray-500 mt-1">If omitted, a standalone CII skeleton is generated.</p>
+                    </div>
+                    <div class="flex gap-3 items-center flex-wrap">
+                        <button id="l2-btn-convert"
+                                class="bg-teal-600 text-white px-4 py-2 rounded hover:bg-teal-700 text-sm font-medium">
+                            Convert &amp; Download .CII
+                        </button>
+                        <span id="l2-status-processing" class="text-xs text-gray-500"></span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Logic 2: Intermediate Output -->
+            <div id="l2-intermediate" class="l2-panel hidden border border-gray-200 rounded-lg p-5 bg-gray-50">
+                <h3 class="text-sm font-semibold mb-3 text-gray-700">Intermediate Output — Export 41-Column CSV</h3>
+                <p class="text-sm text-gray-600 mb-4">
+                    Exports the full 41-column + REL/IEL array CSV generated by
+                    <code class="bg-gray-100 px-1 rounded text-xs">Logic2_exporter.generate_custom_csv</code>.
+                    Requires a file to be loaded in the Processing tab first.
+                </p>
+                <div class="flex gap-3 items-center flex-wrap">
+                    <button id="l2-btn-export-intermediate"
+                            class="bg-indigo-600 text-white px-4 py-2 rounded hover:bg-indigo-700 text-sm font-medium">
+                        Export Intermediate CSV
+                    </button>
+                    <span id="l2-status-intermediate" class="text-xs text-gray-500"></span>
+                </div>
+                <div id="l2-csv-preview-container" class="hidden mt-4">
+                    <label class="block text-sm font-medium mb-1 text-gray-700">CSV Preview (first 5 rows):</label>
+                    <pre id="l2-csv-preview"
+                         class="bg-gray-800 text-green-400 p-3 rounded text-xs overflow-x-auto max-h-48 whitespace-pre"></pre>
+                </div>
+            </div>
+
+            <!-- Logic 2: Settings -->
+            <div id="l2-settings" class="l2-panel hidden border border-gray-200 rounded-lg p-5 bg-gray-50">
+                <h3 class="text-sm font-semibold mb-3 text-gray-700">Logic 2 Settings</h3>
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-5">
+                    <div>
+                        <label class="block text-xs font-semibold text-gray-600 mb-1">ACCDB Element Table Name</label>
+                        <input type="text" id="l2-setting-table-name" value="INPUT_BASIC_ELEMENT_DATA"
+                               class="w-full border border-gray-300 p-1.5 rounded text-sm bg-white">
+                        <p class="text-xs text-gray-400 mt-0.5">Table read from the uploaded ACCDB file</p>
+                    </div>
+                    <div>
+                        <label class="block text-xs font-semibold text-gray-600 mb-1">Parser N1 Base</label>
+                        <input type="number" id="l2-setting-n1" value="2000" min="100" max="9999"
+                               class="w-full border border-gray-300 p-1.5 rounded text-sm bg-white">
+                        <p class="text-xs text-gray-400 mt-0.5">CIIParser N1 parameter (default: 2000)</p>
+                    </div>
+                    <div>
+                        <label class="block text-xs font-semibold text-gray-600 mb-1">CAESAR II Auto-Calc Sentinel</label>
+                        <input type="number" id="l2-setting-sentinel" step="0.0001" value="-1.0101"
+                               class="w-full border border-gray-300 p-1.5 rounded text-sm bg-white">
+                        <p class="text-xs text-gray-400 mt-0.5">Value CAESAR uses to flag auto-calculated records.</p>
+                    </div>
+                    <div>
+                        <label class="block text-xs font-semibold text-gray-600 mb-1">DOS Newlines (CRLF)</label>
+                        <select id="l2-setting-crlf" class="w-full border border-gray-300 p-1.5 rounded text-sm bg-white">
+                            <option value="true" selected>Yes — Windows/CAESAR II standard</option>
+                            <option value="false">No — Unix (LF only)</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="block text-xs font-semibold text-gray-600 mb-1">Server Fallback Parser Method</label>
+                        <select id="l2-setting-fallback-method" class="w-full border border-gray-300 p-1.5 rounded text-sm bg-white">
+                            <option value="default" selected>Method 1 (Fuzzy/Embedded CAESAR II text)</option>
+                            <option value="ms-access-to-csv">Method 2 (ms-access-to-csv / C#)</option>
+                            <option value="accdbexport">Method 3 (accdbexport / R Jackcess)</option>
+                        </select>
+                        <p class="text-xs text-gray-400 mt-0.5">Parser used by local server fallback.</p>
+                    </div>
+                </div>
+                <button id="l2-btn-apply-settings"
+                        class="bg-slate-600 text-white px-4 py-2 rounded hover:bg-slate-700 text-sm font-medium">
+                    Apply Settings
+                </button>
+                <span id="l2-status-settings" class="text-xs text-gray-500 ml-3"></span>
+            </div>
+
+            <!-- Logic 2: Debug -->
+            <div id="l2-debug" class="l2-panel hidden border border-orange-200 rounded-lg p-5 bg-orange-50">
+                <h3 class="text-sm font-semibold mb-3 text-orange-800">&#128269; Debug Inspector &mdash; Logic 2</h3>
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-3">
+                    <div class="border border-orange-100 rounded p-3 bg-white">
+                        <p class="text-xs font-bold text-orange-700 mb-2 uppercase tracking-wide">JS Global State</p>
+                        <button class="text-xs bg-orange-500 text-white px-3 py-1.5 rounded hover:bg-orange-600 font-medium mb-1"
+                                onclick="_l2_inspectJS()">Inspect JS Globals</button>
+                        <pre id="l2-debug-js-out" class="bg-gray-900 text-green-400 p-2 rounded text-xs overflow-auto max-h-56 whitespace-pre min-h-8 mt-1 font-mono"></pre>
+                    </div>
+                    <div class="border border-orange-100 rounded p-3 bg-white">
+                        <p class="text-xs font-bold text-orange-700 mb-2 uppercase tracking-wide">Python State</p>
+                        <button class="text-xs bg-orange-700 text-white px-3 py-1.5 rounded hover:bg-orange-800 font-medium mb-2"
+                                onclick="document.dispatchEvent(new CustomEvent('l2-debug'))">Inspect Python State</button>
+                        <p class="text-xs text-gray-500 mt-1">Output appears in Operation Logs &darr;</p>
+                    </div>
+                </div>
+                <button onclick="document.getElementById('l2-debug-js-out').textContent=''"
+                        class="text-xs bg-gray-200 hover:bg-gray-300 text-gray-700 px-2 py-1 rounded border border-gray-300">Clear JS Output</button>
+            </div>
+        </div>
+
+        <!-- ================================================================ -->
+        <!-- ===== LOGIC 3 TAB ===== -->
+        <!-- ================================================================ -->
+        <div id="tab-logic3" class="main-tab-panel">
+            <div class="p-3 bg-purple-50 border border-purple-200 rounded-lg mb-4">
+                <p class="text-purple-800 font-semibold text-sm">Logic 3 — ACCDB / CSV to CII Generator</p>
+                <p class="text-purple-700 text-xs mt-1">
+                    Converts MS Access databases (.accdb/.mdb) or CSV files directly to CAESAR II neutral (.CII) files.
+                    All processing runs in the browser — no server required.
+                    Core: <code class="bg-purple-100 px-1 rounded">Logic3_generateFinal</code> using
+                    <code class="bg-purple-100 px-1 rounded">Logic3_BENCHMARK_BLOCKS</code>.
+                </p>
+            </div>
+
+            <!-- Logic 3 Sub-tabs -->
+            <div class="flex gap-2 mb-4">
+                <button id="l3-btn-processing"
+                        class="l3-btn px-3 py-1.5 text-sm rounded bg-purple-600 text-white font-medium"
+                        onclick="switchSubTab('l3','processing')">Processing</button>
+                <button id="l3-btn-intermediate"
+                        class="l3-btn px-3 py-1.5 text-sm rounded bg-white border border-gray-300 text-gray-500"
+                        onclick="switchSubTab('l3','intermediate')">Intermediate Output</button>
+                <button id="l3-btn-settings"
+                        class="l3-btn px-3 py-1.5 text-sm rounded bg-white border border-gray-300 text-gray-500"
+                        onclick="switchSubTab('l3','settings')">Settings</button>
+                <button id="l3-btn-debug"
+                        class="l3-btn px-3 py-1.5 text-sm rounded bg-white border border-gray-300 text-gray-500"
+                        onclick="switchSubTab('l3','debug')">&#128269; Debug</button>
+            </div>
+
+            <!-- Logic 3: Processing -->
+            <div id="l3-processing" class="l3-panel border border-gray-200 rounded-lg p-5 bg-gray-50">
+                <h3 class="text-sm font-semibold mb-3 text-gray-700">Output / Processing — Convert to .CII</h3>
+                <div class="flex flex-col gap-4">
+                    <div>
+                        <label class="block text-sm font-medium mb-1">Select Input File(s) (.accdb, .mdb, or multiple .csv files)</label>
+                        <input type="file" id="l3-upload" accept=".accdb,.mdb,.csv" multiple
+                               class="block w-full border border-gray-300 p-2 rounded text-sm bg-white">
+                    </div>
+                    <div id="l3-table-selector" class="hidden">
+                        <label class="block text-sm font-medium mb-1">Select Table from Database</label>
+                        <select id="l3-selected-table"
+                                class="block w-full border border-gray-300 p-2 rounded text-sm bg-white"></select>
+                        <p class="text-xs text-gray-500 mt-1">Default: INPUT_BASIC_ELEMENT_DATA</p>
+                    </div>
+                    <div class="flex gap-3 items-center flex-wrap">
+                        <button id="l3-btn-convert"
+                                class="bg-purple-600 text-white px-4 py-2 rounded hover:bg-purple-700 text-sm font-medium">
+                            Convert &amp; Download .CII
+                        </button>
+                        <span id="l3-status-processing" class="text-xs text-gray-500"></span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Logic 3: Intermediate Output -->
+            <div id="l3-intermediate" class="l3-panel hidden border border-gray-200 rounded-lg p-5 bg-gray-50">
+                <h3 class="text-sm font-semibold mb-3 text-gray-700">Intermediate Output — Export Raw CSV</h3>
+                <p class="text-sm text-gray-600 mb-4">
+                    Exports the raw element data extracted from the selected ACCDB table (or re-downloads your CSV)
+                    as an intermediate CSV file — before CII generation is applied.
+                    Requires a file to be selected in the Processing tab first.
+                </p>
+                <div class="flex gap-3 items-center flex-wrap">
+                    <button id="l3-btn-export-intermediate"
+                            class="bg-indigo-600 text-white px-4 py-2 rounded hover:bg-indigo-700 text-sm font-medium">
+                        Export Intermediate CSV
+                    </button>
+                    <span id="l3-status-intermediate" class="text-xs text-gray-500"></span>
+                </div>
+                <div id="l3-csv-preview-container" class="hidden mt-4">
+                    <label class="block text-sm font-medium mb-1 text-gray-700">CSV Preview (first 5 rows):</label>
+                    <pre id="l3-csv-preview"
+                         class="bg-gray-800 text-green-400 p-3 rounded text-xs overflow-x-auto max-h-48 whitespace-pre"></pre>
+                </div>
+            </div>
+
+            <!-- Logic 3: Settings -->
+            <div id="l3-settings" class="l3-panel hidden border border-gray-200 rounded-lg p-5 bg-gray-50">
+                <h3 class="text-sm font-semibold mb-3 text-gray-700">Logic 3 Settings</h3>
+                <p class="text-sm text-gray-600 mb-4">
+                    Configure behavior for Logic 3 CII generation. Changes apply to the next conversion.
+                </p>
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-5">
+                    <div>
+                        <label class="block text-xs font-semibold text-gray-600 mb-1">ACCDB Element Table Name</label>
+                        <input type="text" id="l3-setting-table-name" value="INPUT_BASIC_ELEMENT_DATA"
+                               class="w-full border border-gray-300 p-1.5 rounded text-sm bg-white">
+                        <p class="text-xs text-gray-400 mt-0.5">Table read from the uploaded ACCDB file</p>
+                    </div>
+                    <div>
+                        <label class="block text-xs font-semibold text-gray-600 mb-1">Mill Tolerance Mode</label>
+                        <select id="l3-setting-mill-tol" class="w-full border border-gray-300 p-1.5 rounded text-sm bg-white">
+                            <option value="default" selected>9999.99 — Use CAESAR II default</option>
+                            <option value="custom">From ACCDB / CSV field</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="block text-xs font-semibold text-gray-600 mb-1">Server Fallback Parser Method</label>
+                        <select id="l3-setting-fallback-method" class="w-full border border-gray-300 p-1.5 rounded text-sm bg-white">
+                            <option value="default" selected>Method 1 (Fuzzy/Embedded CAESAR II text)</option>
+                            <option value="ms-access-to-csv">Method 2 (ms-access-to-csv / C#)</option>
+                            <option value="accdbexport">Method 3 (accdbexport / R Jackcess)</option>
+                        </select>
+                        <p class="text-xs text-gray-400 mt-0.5">Parser used by local server fallback.</p>
+                    </div>
+                    <div class="sm:col-span-2">
+                        <label class="block text-xs font-semibold text-gray-600 mb-1">Benchmark Template</label>
+                        <p class="text-xs text-gray-500 p-2 bg-white border border-gray-200 rounded font-mono">
+                            Logic3_BENCHMARK_BLOCKS (built-in, loaded from benchmark_data.js)
+                        </p>
+                    </div>
+                </div>
+                <button id="l3-btn-apply-settings"
+                        class="bg-slate-600 text-white px-4 py-2 rounded hover:bg-slate-700 text-sm font-medium">
+                    Apply Settings
+                </button>
+                <span id="l3-status-settings" class="text-xs text-gray-500 ml-3"></span>
+            </div>
+
+            <!-- Logic 3: Debug (pure JS — no Python panel) -->
+            <div id="l3-debug" class="l3-panel hidden border border-orange-200 rounded-lg p-5 bg-orange-50">
+                <h3 class="text-sm font-semibold mb-3 text-orange-800">&#128269; Debug Inspector &mdash; Logic 3 (Pure JS)</h3>
+                <div class="border border-orange-100 rounded p-3 bg-white mb-3">
+                    <p class="text-xs font-bold text-orange-700 mb-2 uppercase tracking-wide">JS State</p>
+                    <div class="flex gap-2 flex-wrap mb-2">
+                        <button class="text-xs bg-orange-500 text-white px-3 py-1.5 rounded hover:bg-orange-600 font-medium"
+                                onclick="_l3_inspectJS()">Inspect JS State</button>
+                        <button class="text-xs bg-purple-600 text-white px-3 py-1.5 rounded hover:bg-purple-700 font-medium"
+                                onclick="_l3_testGenerate()">&#9654; Test Single Row</button>
+                    </div>
+                    <pre id="l3-debug-js-out" class="bg-gray-900 text-green-400 p-2 rounded text-xs overflow-auto max-h-64 whitespace-pre min-h-8 mt-1 font-mono"></pre>
+                </div>
+                <button onclick="document.getElementById('l3-debug-js-out').textContent=''"
+                        class="text-xs bg-gray-200 hover:bg-gray-300 text-gray-700 px-2 py-1 rounded border border-gray-300">Clear Output</button>
+            </div>
+        </div>
+
+        <!-- ================================================================ -->
+        <!-- ===== LOGIC 4 TAB ===== -->
+        <!-- ================================================================ -->
+        <div id="tab-logic4" class="main-tab-panel hidden">
+            <div class="p-3 bg-emerald-50 border border-emerald-200 rounded-lg mb-4">
+                <p class="text-emerald-800 font-semibold text-sm">Logic 4 &#9889; &mdash; Hybrid Generator (Multi-Table + Full Aux Data)</p>
+                <p class="text-emerald-700 text-xs mt-1">
+                    Extracts all 5 ACCDB tables simultaneously. Builds real BEND, RIGID, RESTRANT, SIF&amp;TEES records
+                    from confirmed column names. Exports a Universal CSV (~130 columns) that can
+                    re-generate the .CII without the original ACCDB.
+                    Core: <code class="bg-emerald-100 px-1 rounded">Logic4_pipeline.build_hybrid_cii()</code>.
+                </p>
+            </div>
+
+            <!-- Logic 4 Sub-tabs -->
+            <div class="flex gap-2 mb-4">
+                <button id="l4-btn-processing"
+                        class="l4-btn px-3 py-1.5 text-sm rounded bg-emerald-600 text-white font-medium"
+                        onclick="switchSubTab('l4','processing')">Processing</button>
+                <button id="l4-btn-intermediate"
+                        class="l4-btn px-3 py-1.5 text-sm rounded bg-white border border-gray-300 text-gray-500"
+                        onclick="switchSubTab('l4','intermediate')">Universal CSV</button>
+                <button id="l4-btn-settings"
+                        class="l4-btn px-3 py-1.5 text-sm rounded bg-white border border-gray-300 text-gray-500"
+                        onclick="switchSubTab('l4','settings')">Settings</button>
+                <button id="l4-btn-debug"
+                        class="l4-btn px-3 py-1.5 text-sm rounded bg-white border border-gray-300 text-gray-500"
+                        onclick="switchSubTab('l4','debug')">&#128269; Debug</button>
+            </div>
+
+            <!-- Logic 4: Processing -->
+            <div id="l4-processing" class="l4-panel border border-gray-200 rounded-lg p-5 bg-gray-50">
+                <h3 class="text-sm font-semibold mb-3 text-gray-700">Output / Processing &mdash; Convert to .CII</h3>
+                <div class="flex flex-col gap-4">
+                    <div>
+                        <label class="block text-sm font-medium mb-1">Select Input File(s) (.accdb, .mdb, or multiple .csv files)</label>
+                        <input type="file" id="l4-upload" accept=".accdb,.mdb,.csv" multiple
+                               class="block w-full border border-gray-300 p-2 rounded text-sm bg-white">
+                        <p class="text-xs text-gray-500 mt-1">ACCDB/Multiple CSVs: all 5 INPUT_* tables are extracted automatically. Single Universal CSV: re-generates CII with no ACCDB required.</p>
+                    </div>
+                    <div id="l4-table-status" class="hidden p-3 bg-emerald-50 border border-emerald-200 rounded text-xs text-emerald-800 font-mono">
+                        <!-- populated by _l4_onFileChange -->
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium mb-1">Base .CII File (optional &mdash; for merge mode)</label>
+                        <input type="file" id="l4-upload-cii" accept=".cii"
+                               class="block w-full border border-gray-300 p-2 rounded text-sm bg-white">
+                        <p class="text-xs text-gray-500 mt-1">If omitted, a standalone CII skeleton is generated.</p>
+                    </div>
+                    <div class="flex gap-3 items-center flex-wrap">
+                        <button id="l4-btn-convert"
+                                class="bg-emerald-600 text-white px-4 py-2 rounded hover:bg-emerald-700 text-sm font-medium">
+                            Convert &amp; Download .CII
+                        </button>
+                        <span id="l4-status-processing" class="text-xs text-gray-500"></span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Logic 4: Universal CSV -->
+            <div id="l4-intermediate" class="l4-panel hidden border border-gray-200 rounded-lg p-5 bg-gray-50">
+                <h3 class="text-sm font-semibold mb-3 text-gray-700">Universal CSV &mdash; ~130 Columns (All ACCDB Tables)</h3>
+                <p class="text-sm text-gray-600 mb-2">
+                    Exports an element-centric CSV with all pipe, thermal, material, and aux data columns
+                    from all 5 ACCDB tables. <strong>BND_</strong>, <strong>RST_</strong>, <strong>RGD_</strong>,
+                    and <strong>SIF_</strong> prefixed columns contain joined aux-table data per element.
+                </p>
+                <p class="text-xs text-gray-500 mb-4">
+                    This CSV can be edited and re-uploaded to Logic 4 to regenerate the .CII without the original ACCDB.
+                </p>
+                <div class="flex gap-3 items-center flex-wrap">
+                    <button id="l4-btn-export-intermediate"
+                            class="bg-indigo-600 text-white px-4 py-2 rounded hover:bg-indigo-700 text-sm font-medium">
+                        Export Universal CSV
+                    </button>
+                    <span id="l4-status-intermediate" class="text-xs text-gray-500"></span>
+                </div>
+                <div id="l4-csv-preview-container" class="hidden mt-4">
+                    <label class="block text-sm font-medium mb-1 text-gray-700">CSV Preview (first 5 rows):</label>
+                    <pre id="l4-csv-preview"
+                         class="bg-gray-800 text-green-400 p-3 rounded text-xs overflow-x-auto max-h-48 whitespace-pre"></pre>
+                </div>
+            </div>
+
+            <!-- Logic 4: Settings -->
+            <div id="l4-settings" class="l4-panel hidden border border-gray-200 rounded-lg p-5 bg-gray-50">
+                <h3 class="text-sm font-semibold mb-3 text-gray-700">Logic 4 Settings</h3>
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-5">
+                    <div>
+                        <label class="block text-xs font-semibold text-gray-600 mb-1">CAESAR II Auto-Calc Sentinel</label>
+                        <input type="number" id="l4-setting-sentinel" step="0.0001" value="-1.0101"
+                               class="w-full border border-gray-300 p-1.5 rounded text-sm bg-white">
+                        <p class="text-xs text-gray-400 mt-0.5">Value CAESAR uses to flag auto-calculated records.</p>
+                    </div>
+                    <div>
+                        <label class="block text-xs font-semibold text-gray-600 mb-1">Parser N1 Base</label>
+                        <input type="number" id="l4-setting-n1" value="2000" min="100" max="9999"
+                               class="w-full border border-gray-300 p-1.5 rounded text-sm bg-white">
+                        <p class="text-xs text-gray-400 mt-0.5">CIIParser N1 parameter for base .CII parsing (default: 2000)</p>
+                    </div>
+                    <div>
+                        <label class="block text-xs font-semibold text-gray-600 mb-1">DOS Newlines (CRLF)</label>
+                        <select id="l4-setting-crlf" class="w-full border border-gray-300 p-1.5 rounded text-sm bg-white">
+                            <option value="true" selected>Yes &mdash; Windows/CAESAR II standard</option>
+                            <option value="false">No &mdash; Unix (LF only)</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="block text-xs font-semibold text-gray-600 mb-1">Server Fallback Parser Method</label>
+                        <select id="l4-setting-fallback-method" class="w-full border border-gray-300 p-1.5 rounded text-sm bg-white">
+                            <option value="default" selected>Method 1 (Fuzzy/Embedded CAESAR II text)</option>
+                            <option value="ms-access-to-csv">Method 2 (ms-access-to-csv / C#)</option>
+                            <option value="accdbexport">Method 3 (accdbexport / R Jackcess)</option>
+                        </select>
+                        <p class="text-xs text-gray-400 mt-0.5">Parser used by local server fallback.</p>
+                    </div>
+                </div>
+                <button id="l4-btn-apply-settings"
+                        class="bg-slate-600 text-white px-4 py-2 rounded hover:bg-slate-700 text-sm font-medium">
+                    Apply Settings
+                </button>
+                <span id="l4-status-settings" class="text-xs text-gray-500 ml-3"></span>
+            </div>
+
+            <!-- Logic 4: Debug -->
+            <div id="l4-debug" class="l4-panel hidden border border-orange-200 rounded-lg p-5 bg-orange-50">
+                <h3 class="text-sm font-semibold mb-3 text-orange-800">&#128269; Debug Inspector &mdash; Logic 4</h3>
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-3">
+                    <div class="border border-orange-100 rounded p-3 bg-white">
+                        <p class="text-xs font-bold text-orange-700 mb-2 uppercase tracking-wide">JS Global State (All 5 Tables)</p>
+                        <button class="text-xs bg-orange-500 text-white px-3 py-1.5 rounded hover:bg-orange-600 font-medium mb-1"
+                                onclick="_l4_inspectJS()">Inspect JS Globals</button>
+                        <pre id="l4-debug-js-out" class="bg-gray-900 text-green-400 p-2 rounded text-xs overflow-auto max-h-56 whitespace-pre min-h-8 mt-1 font-mono"></pre>
+                    </div>
+                    <div class="border border-orange-100 rounded p-3 bg-white">
+                        <p class="text-xs font-bold text-orange-700 mb-2 uppercase tracking-wide">Python State</p>
+                        <button class="text-xs bg-orange-700 text-white px-3 py-1.5 rounded hover:bg-orange-800 font-medium mb-2"
+                                onclick="document.dispatchEvent(new CustomEvent('l4-debug'))">Inspect Python State</button>
+                        <p class="text-xs text-gray-500 mt-1">Output appears in Operation Logs &darr;</p>
+                    </div>
+                </div>
+                <button onclick="document.getElementById('l4-debug-js-out').textContent=''"
+                        class="text-xs bg-gray-200 hover:bg-gray-300 text-gray-700 px-2 py-1 rounded border border-gray-300">Clear JS Output</button>
+            </div>
+        </div>
+
+        <!-- ================================================================ -->
+        <!-- ===== ACCDB TOOLS TAB ===== -->
+        <!-- ================================================================ -->
+        <div id="tab-accdb-tools" class="main-tab-panel hidden">
+            <div class="border border-gray-300 rounded-lg p-5 mb-5 bg-gray-50">
+                <h1 class="text-lg font-semibold mb-4 border-b pb-2 text-gray-800">&#128452; Access &#8594; CSV Converter</h1>
+                <p class="text-sm text-gray-600 mb-6">
+                    Every table exports as its own CSV, packaged in a ZIP.<br>
+                    <strong>Fully offline</strong> &#8212; no internet, no server, no install.
+                    File never leaves your machine.
+                </p>
+                <div class="border-2 border-dashed border-blue-300 rounded-lg p-10 text-center cursor-pointer transition-colors bg-white hover:border-blue-500 hover:bg-blue-50 relative" id="dz">
+                    <input type="file" id="fi" accept=".accdb,.mdb" class="absolute inset-0 opacity-0 cursor-pointer w-full h-full">
+                    <div class="text-4xl mb-2">&#128194;</div>
+                    <div class="text-sm font-medium text-gray-700">Click or drag &amp; drop your .accdb / .mdb file</div>
+                    <div class="text-xs text-gray-500 mt-1">Works offline &#183; No data sent anywhere</div>
+                </div>
+                <div class="mt-4 hidden" id="pw">
+                    <div class="bg-gray-200 rounded-full h-2 overflow-hidden"><div class="h-full bg-gradient-to-r from-blue-500 to-purple-600 rounded-full w-0 transition-all duration-300" id="pf"></div></div>
+                    <div class="text-xs text-gray-600 mt-1 text-right" id="pl">Starting...</div>
+                </div>
+                <div class="mt-4 bg-slate-900 rounded-lg p-3 max-h-64 overflow-y-auto hidden font-mono text-xs leading-relaxed text-slate-300 break-all whitespace-pre-wrap" id="lb"></div>
+                <div class="hidden gap-2 mt-4 flex-wrap" id="sum"></div>
+                <button class="hidden mt-4 w-full p-3 bg-gradient-to-r from-blue-500 to-purple-600 text-white text-sm font-semibold border-none rounded-lg cursor-pointer transition-opacity hover:opacity-90" id="dlBtn">Download CSVs as ZIP</button>
+                <div class="hidden mt-3 text-sm text-blue-600 cursor-pointer text-center hover:underline" id="rst" onclick="resetAccdbUI()">&#8617; Convert another file</div>
+            </div>
+        </div>
+
+        <!-- ================================================================ -->
+        <!-- ===== CII TOOLS TAB ===== -->
+        <!-- ================================================================ -->
+        <div id="tab-cii-tools" class="main-tab-panel hidden">
+
+            <!-- Parse CII → CSV -->
+            <div class="border border-gray-300 rounded-lg p-5 mb-5 bg-gray-50">
+                <h2 class="text-lg font-semibold mb-4 border-b pb-2 text-gray-800">1. Convert .CII to CSV</h2>
+                <div class="flex flex-col gap-4">
+                    <div>
+                        <label class="block text-sm font-medium mb-1">Select Original .CII File</label>
+                        <input type="file" id="upload-cii" accept=".cii"
+                               class="block w-full border border-gray-300 p-2 rounded bg-white">
+                    </div>
+                    <div>
+                        <button id="btn-export-csv"
+                                class="bg-blue-600 text-white px-4 py-2 rounded hover:bg-blue-700 disabled:opacity-50 text-sm">
+                            Parse &amp; Download CSV
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Reconstruct CSV → CII -->
+            <div class="border border-gray-300 rounded-lg p-5 bg-gray-50">
+                <h2 class="text-lg font-semibold mb-4 border-b pb-2 text-gray-800">2. Reconstruct .CII from CSV</h2>
+                <p class="text-sm text-gray-600 mb-4">
+                    Optional: Provide the original .CII. If skipped, a standalone .CII will be reconstructed
+                    entirely from the CSV data.
+                </p>
+                <div class="flex flex-col gap-4">
+                    <div>
+                        <label class="block text-sm font-medium mb-1">Select Modified CSV</label>
+                        <input type="file" id="upload-csv" accept=".csv"
+                               class="block w-full border border-gray-300 p-2 rounded bg-white">
+                    </div>
+                    <div>
+                        <button id="btn-reconstruct"
+                                class="bg-green-600 text-white px-4 py-2 rounded hover:bg-green-700 disabled:opacity-50 text-sm">
+                            Reconstruct &amp; Download .CII
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- CII Tools: Debug -->
+            <div class="border border-orange-200 rounded-lg p-5 bg-orange-50 mt-5">
+                <h2 class="text-sm font-semibold mb-3 text-orange-800">&#128269; Debug Inspector &mdash; CII Tools</h2>
+                <div class="border border-orange-100 rounded p-3 bg-white">
+                    <p class="text-xs font-bold text-orange-700 mb-2 uppercase tracking-wide">Python State</p>
+                    <button class="text-xs bg-orange-700 text-white px-3 py-1.5 rounded hover:bg-orange-800 font-medium"
+                            onclick="document.dispatchEvent(new CustomEvent('cii-debug'))">Inspect Python State</button>
+                    <p class="text-xs text-gray-500 mt-2">Shows parsed data element count, CONTROL values, and aux_data keys in Operation Logs &darr;</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- ===== Diagnostics ===== -->
+        <div class="mt-6 p-4 border border-rose-200 rounded-lg bg-rose-50 hidden" id="diagnostics-panel">
+            <div class="flex justify-between items-center mb-2">
+                <h3 class="font-bold text-rose-800 text-sm">Access Import Diagnostics:</h3>
+                <div class="flex gap-2">
+                    <button id="btn-copy-diagnostics"
+                            class="text-xs bg-rose-600 hover:bg-rose-700 text-white px-3 py-1.5 rounded font-medium">
+                        Copy Debug JSON
+                    </button>
+                    <button id="btn-clear-diagnostics"
+                            class="text-xs bg-white hover:bg-rose-100 text-rose-700 px-3 py-1.5 rounded border border-rose-300">
+                        Clear
+                    </button>
+                </div>
+            </div>
+            <pre id="diagnostics-content" class="bg-gray-900 text-green-400 p-3 rounded text-xs overflow-auto max-h-48 whitespace-pre font-mono shadow-inner"></pre>
+        </div>
+
+        <script>
+            document.addEventListener('DOMContentLoaded', () => {
+                const diagPanel = document.getElementById('diagnostics-panel');
+                const diagContent = document.getElementById('diagnostics-content');
+
+                document.addEventListener('ACCESS_DIAGNOSTICS', (e) => {
+                    diagPanel.classList.remove('hidden');
+                    const text = JSON.stringify(e.detail, null, 2);
+                    diagContent.textContent = text + '\n\n' + diagContent.textContent;
+                });
+
+                document.getElementById('btn-copy-diagnostics').addEventListener('click', () => {
+                    const text = JSON.stringify(window.AccessDiagnostics._diagnostics, null, 2);
+                    navigator.clipboard.writeText(text).then(() => {
+                        const btn = document.getElementById('btn-copy-diagnostics');
+                        const orig = btn.textContent;
+                        btn.textContent = 'Copied!';
+                        setTimeout(() => btn.textContent = orig, 2000);
+                    });
+                });
+
+                document.getElementById('btn-clear-diagnostics').addEventListener('click', () => {
+                    diagContent.textContent = '';
+                    diagPanel.classList.add('hidden');
+                    window.AccessDiagnostics._diagnostics = [];
+                });
+            });
+        </script>
+
+        <!-- ===== Logs ===== -->
+        <div class="mt-6 text-sm text-gray-500 flex flex-col h-64" id="logs-container">
+            <div class="flex justify-between items-center mb-2">
+                <h3 class="font-bold text-gray-700">Operation Logs:</h3>
+                <button id="btn-clear-logs"
+                        class="text-xs bg-gray-200 hover:bg-gray-300 text-gray-700 px-2 py-1 rounded border border-gray-300">
+                    Clear Logs
+                </button>
+            </div>
+            <div id="status-logs"
+                 class="bg-[#f5f5f5] text-gray-800 p-2 rounded border border-gray-300 flex-1 overflow-y-auto font-mono text-xs whitespace-pre-wrap divide-y divide-gray-200 shadow-inner">
+            </div>
+        </div>
+
+        <div class="mt-4 text-xs text-gray-400 text-right">ver.14-03-26 time 12.00</div>
+    </div><!-- #app -->
+</div><!-- outer container -->
+
+<!-- PyScript Config -->
+<py-config>
+    packages = ["pandas", "pydantic"]
+
+    [[fetch]]
+    files = [
+        "./export_cii.py",
+        "./config.py",
+        "./parser.py",
+        "./serializer.py",
+        "./exporter.py",
+        "./importer.py",
+        "./comparator.py",
+        "./optimizer.py",
+        "./optimizer_settings.py",
+        "./logger.py",
+        "./Logic2_config.py",
+        "./Logic2_parser.py",
+        "./Logic2_serializer.py",
+        "./Logic2_importer.py",
+        "./Logic2_exporter.py",
+        "./Logic1_logger.py",
+        "./Logic1_config.py",
+        "./Logic1_parser.py",
+        "./Logic1_serializer.py",
+        "./Logic1_importer.py",
+        "./Logic1_exporter.py",
+        "./Logic1_comparator.py",
+        "./Logic1_optimizer_settings.py",
+        "./Logic1_optimizer.py",
+        "./Logic1_export_cii.py",
+        "./Logic4_pipeline.py"
+    ]
+</py-config>
+
+
+<!-- ================================================================ -->
+<!-- Tab & UI Management JS                                            -->
+<!-- ================================================================ -->
+<script>
+// ----- Main tab switching -----
+function switchMainTab(tabId) {
+    document.querySelectorAll('.main-tab-panel').forEach(t => t.classList.add('hidden'));
+    document.querySelectorAll('.main-tab-btn').forEach(b => {
+        b.classList.remove('border-blue-600', 'text-blue-600');
+        b.classList.add('border-transparent', 'text-gray-500');
+    });
+
+    const panel = document.getElementById(tabId);
+    if (panel) panel.classList.remove('hidden');
+
+    const logicKey = tabId.replace('tab-', '');
+    const btn = document.getElementById('tab-btn-' + logicKey);
+    if (btn) {
+        btn.classList.add('border-blue-600', 'text-blue-600');
+        btn.classList.remove('border-transparent', 'text-gray-500');
+    }
+
+    // Sync dropdown if it's a logic tab
+    const dd = document.getElementById('logic-dropdown');
+    if (dd && ['logic1','logic2','logic3','logic4'].includes(logicKey)) {
+        dd.value = logicKey;
+    }
+    if (logicKey === 'accdb-tools') {
+        if (typeof resetAccdbUI === 'function') resetAccdbUI();
+    }
+}
+
+// ----- Sub-tab switching (generic, prefix-based) -----
+function switchSubTab(prefix, panel) {
+    // Hide all panels for this logic
+    document.querySelectorAll('.' + prefix + '-panel').forEach(el => el.classList.add('hidden'));
+    // Deactivate all sub-tab buttons for this logic
+    document.querySelectorAll('.' + prefix + '-btn').forEach(btn => {
+        btn.classList.remove('bg-purple-600', 'bg-teal-600', 'bg-slate-600', 'bg-emerald-600', 'text-white', 'font-medium');
+        btn.classList.add('bg-white', 'border', 'border-gray-300', 'text-gray-500');
+    });
+
+    // Show target panel
+    const panelEl = document.getElementById(prefix + '-' + panel);
+    if (panelEl) panelEl.classList.remove('hidden');
+
+    // Activate button — l3=purple, l2=teal, l1=slate, l4=emerald
+    const activeBtn = document.getElementById(prefix + '-btn-' + panel);
+    if (activeBtn) {
+        activeBtn.classList.remove('bg-white', 'border', 'border-gray-300', 'text-gray-500');
+        const activeBg = prefix === 'l3' ? 'bg-purple-600'
+                       : prefix === 'l2' ? 'bg-teal-600'
+                       : prefix === 'l4' ? 'bg-emerald-600'
+                       : 'bg-slate-600';
+        activeBtn.classList.add(activeBg, 'text-white', 'font-medium');
+    }
+}
+
+// ----- Logic 3 globals -----
+let _l3_fileBuffer = null;   // ArrayBuffer of last loaded ACCDB
+let _l3_csvText   = null;   // CSV text (from CSV input or extracted from ACCDB)
+
+function _l3_log(msg) {
+    // Append to main log panel and the inline status spans
+    const logEl = document.getElementById('status-logs');
+    if (logEl) {
+        const div = document.createElement('div');
+        div.className = 'py-1 px-2';
+        div.textContent = msg;
+        logEl.appendChild(div);
+        logEl.scrollTop = logEl.scrollHeight;
+    }
+}
+
+function _l3_setStatus(panel, msg) {
+    const el = document.getElementById('l3-status-' + panel);
+    if (el) el.textContent = msg;
+}
+
+// Parse plain CSV text → array of objects
+function _l3_parseCSV(text) {
+    return window.CSVAdapter.parse(text);
+}
+
+// Convert array of objects → CSV string
+function _l3_rowsToCSV(rows) {
+    if (!rows || rows.length === 0) return '';
+    const headers = Object.keys(rows[0]);
+    const lines = [headers.join(',')];
+    for (const row of rows) {
+        lines.push(headers.map(h => {
+            let v = row[h];
+            if (v === null || v === undefined) return '';
+            v = String(v);
+            if (v.includes(',') || v.includes('"')) return '"' + v.replace(/"/g, '""') + '"';
+            return v;
+        }).join(','));
+    }
+    return lines.join('\n') + '\n';
+}
+
+function _l3_downloadText(text, filename, mime) {
+    const blob = new Blob([text], { type: mime || 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+}
+
+// Called when user picks a file for Logic 3
+async function _l3_onFileChange(event) {
+    _l3_fileBuffer = null;
+    _l3_csvText    = null;
+    window.AppState.logic3.tableRows = null;
+
+    const files = event.target.files;
+    if (!files || files.length === 0) return;
+
+    const tableSelector = document.getElementById('l3-table-selector');
+    const tableSelect   = document.getElementById('l3-selected-table');
+    tableSelector.classList.add('hidden');
+
+    if (files.length > 1) {
+        _l3_log(`Logic 3: Processing ${files.length} multiple CSV files...`);
+        const { tablesData, tablesList } = await window.CSVAdapter.parseMultiple(files);
+        window.AppState.logic3.tablesData = tablesData;
+        window.AppState.logic3.inputFilename = 'multiple_csv_files';
+
+        tableSelect.innerHTML = '';
+        const preferredTable = document.getElementById('l3-setting-table-name').value.trim() || window.ACCESS_IMPORT_CONFIG.defaultTable;
+        tablesList.forEach(t => {
+            const opt = document.createElement('option');
+            opt.value = t;
+            opt.textContent = t;
+            if (t.toUpperCase().includes('ELEMENT_DATA') || t === preferredTable) opt.selected = true;
+            tableSelect.appendChild(opt);
+        });
+        tableSelector.classList.remove('hidden');
+        _l3_log('Logic 3: Loaded multiple CSVs. Select table then click Convert.');
+        return;
+    }
+
+    const file = files[0];
+    const name = file.name.toLowerCase();
+
+    if (window.AccessAdapter.isAccessFile(file.name)) {
+        _l3_log('Reading Access file: ' + file.name);
+        _l3_fileBuffer = await file.arrayBuffer();
+        try {
+            const response = await window.AccessAdapter.readTableNames(_l3_fileBuffer, { name: file.name, size: file.size }, 'l3', (msg) => _l3_log(`Status: ${msg}`));
+            const tablesList = response.tablesList || [];
+            tableSelect.innerHTML = '';
+            const preferredTable = document.getElementById('l3-setting-table-name').value.trim() || window.ACCESS_IMPORT_CONFIG.defaultTable;
+            tablesList.forEach(t => {
+                const opt = document.createElement('option');
+                opt.value = t;
+                opt.textContent = t;
+                if (t === preferredTable) opt.selected = true;
+                tableSelect.appendChild(opt);
+            });
+            tableSelector.classList.remove('hidden');
+            _l3_log('Found ' + tablesList.length + ' table(s). Select table then click Convert.');
+        } catch (e) {
+            _l3_log('ERROR extracting tables: ' + e.message);
+        }
+    } else if (name.endsWith('.csv')) {
+        _l3_log('CSV file selected: ' + file.name);
+        _l3_csvText = await file.text();
+        window.AppState.logic3.tableRows = _l3_parseCSV(_l3_csvText);
+        _l3_log('CSV loaded: ' + window.AppState.logic3.tableRows.length + ' row(s).');
+        tableSelector.classList.add('hidden');
+    }
+}
+
+// Logic 3: Convert & Download .CII
+async function _l3_convert() {
+    _l3_setStatus('processing', '');
+    const fileInput = document.getElementById('l3-upload');
+    if (!fileInput.files || fileInput.files.length === 0) {
+        _l3_setStatus('processing', 'No file selected.');
+        _l3_log('ERROR: No file selected in Logic 3 Processing tab.');
+        return;
+    }
+
+    const tableName = document.getElementById('l3-selected-table').value
+                      || document.getElementById('l3-setting-table-name').value.trim()
+                      || window.ACCESS_IMPORT_CONFIG.defaultTable;
+
+    let rows = null;
+    let fileName = 'multiple_csvs';
+
+    if (fileInput.files.length > 1) {
+        if (!window.AppState.logic3.tablesData || !window.AppState.logic3.tablesData[tableName]) {
+            _l3_log(`ERROR: Table ${tableName} not loaded from selected CSVs.`);
+            return;
+        }
+        rows = window.AppState.logic3.tablesData[tableName];
+        window.AppState.logic3.tableRows = rows;
+    } else {
+        const file = fileInput.files[0];
+        fileName = file.name;
+        const name = file.name.toLowerCase();
+
+        if (window.AccessAdapter.isAccessFile(file.name)) {
+            if (!_l3_fileBuffer) {
+                _l3_log('ERROR: Buffer not loaded. Re-select the file.');
+                return;
+            }
+            try {
+                const response = await window.AccessAdapter.parseAccessTables(_l3_fileBuffer, { tableName }, { name: file.name, size: file.size }, 'l3', (msg) => {
+                    _l3_setStatus('processing', msg);
+                    _l3_log(`Logic 3 Status: ${msg}`);
+                });
+                window.AppState.logic3.tableRows = response.tablesData[tableName];
+                _l3_log('Extracted ' + window.AppState.logic3.tableRows.length + ' row(s) from table "' + tableName + '".');
+                rows = window.AppState.logic3.tableRows;
+            } catch (e) {
+                _l3_log('ERROR: ' + e.message);
+                _l3_setStatus('processing', 'Failed: ' + e.message);
+                return;
+            }
+        } else if (name.endsWith('.csv')) {
+            if (!window.AppState.logic3.tableRows) {
+                _l3_log('ERROR: CSV not loaded. Re-select the file.');
+                return;
+            }
+            rows = window.AppState.logic3.tableRows;
+        } else {
+            _l3_log('ERROR: Unsupported file type.');
+            return;
+        }
+    }
+
+    if (!rows || rows.length === 0) {
+        _l3_log('ERROR: No data rows found in input.');
+        _l3_setStatus('processing', 'No data rows found.');
+        return;
+    }
+
+    _l3_log('Running Logic3_generateFinal on ' + rows.length + ' element(s)...');
+    try {
+        const ciiText = Logic3_generateFinal(rows, Logic3_BENCHMARK_BLOCKS);
+        const outName = fileName.replace(/\.(accdb|mdb|csv)$/i, '') + '.cii';
+        _l3_downloadText(ciiText, outName, 'text/plain');
+        _l3_log('SUCCESS: Downloaded ' + outName + ' (' + ciiText.length + ' bytes).');
+        _l3_setStatus('processing', 'Downloaded ' + outName);
+    } catch (e) {
+        _l3_log('ERROR during CII generation: ' + e.message);
+        _l3_setStatus('processing', 'Failed: ' + e.message);
+    }
+}
+
+// Logic 3: Export Intermediate CSV
+async function _l3_exportIntermediate() {
+    _l3_setStatus('intermediate', '');
+    const fileInput = document.getElementById('l3-upload');
+    if (!fileInput.files || fileInput.files.length === 0) {
+        _l3_log('ERROR: No file selected. Select a file in the Processing tab first.');
+        _l3_setStatus('intermediate', 'No file selected.');
+        return;
+    }
+
+    const file = fileInput.files[0];
+    const name = file.name.toLowerCase();
+    let csvOut = '';
+    let rowCount = 0;
+
+    if (window.AccessAdapter.isAccessFile(file.name)) {
+        if (!_l3_fileBuffer) {
+            _l3_log('ERROR: Buffer not loaded. Re-select the file.');
+            return;
+        }
+        const tableName = document.getElementById('l3-selected-table').value
+                          || document.getElementById('l3-setting-table-name').value.trim()
+                          || window.ACCESS_IMPORT_CONFIG.defaultTable;
+        try {
+            _l3_log('Logic 3: parsing tables for CSV export...');
+            const response = await window.AccessAdapter.parseAccessTables(_l3_fileBuffer, { tableName }, { name: file.name, size: file.size }, 'l3');
+            csvOut = _l3_rowsToCSV(response.tablesData[tableName]);
+            rowCount = response.tablesData[tableName].length;
+        } catch (e) {
+            _l3_log('ERROR extracting intermediate CSV: ' + e.message);
+            _l3_setStatus('intermediate', 'Failed: ' + e.message);
+            return;
+        }
+    } else if (name.endsWith('.csv')) {
+        csvOut   = _l3_csvText || '';
+    rowCount = (window.AppState.logic3.tableRows || []).length;
+    }
+
+    if (!csvOut) {
+        _l3_log('ERROR: No CSV data to export.');
+        _l3_setStatus('intermediate', 'No data.');
+        return;
+    }
+
+    const outName = file.name.replace(/\.(accdb|mdb|csv)$/i, '') + '_intermediate.csv';
+    _l3_downloadText(csvOut, outName, 'text/csv');
+    _l3_log('Intermediate CSV exported: ' + outName + ' (' + rowCount + ' rows).');
+    _l3_setStatus('intermediate', 'Downloaded ' + outName);
+
+    // Show preview (first 5 rows)
+    const previewEl = document.getElementById('l3-csv-preview');
+    const container = document.getElementById('l3-csv-preview-container');
+    const previewLines = csvOut.split('\n').slice(0, 6).join('\n');
+    previewEl.textContent = previewLines;
+    container.classList.remove('hidden');
+}
+
+// Logic 3: Apply Settings
+function _l3_applySettings() {
+    _l3_setStatus('settings', 'Settings applied.');
+    _l3_log('Logic 3 settings updated.');
+}
+
+// ================================================================
+// Logic 2 JS helpers — file loading (ACCDB/CSV via mdb-reader)
+// Python handlers (on_l2_convert etc.) are in the PyScript block.
+// ================================================================
+let _l2_fileBuffer = null;
+let _l2_csvText    = null;
+
+function _l2_log(msg) {
+    const logEl = document.getElementById('status-logs');
+    if (logEl) {
+        const div = document.createElement('div');
+        div.className = 'py-1 px-2';
+        div.textContent = msg;
+        logEl.appendChild(div);
+        logEl.scrollTop = logEl.scrollHeight;
+    }
+}
+
+function _l2_setStatus(panel, msg) {
+    const el = document.getElementById('l2-status-' + panel);
+    if (el) el.textContent = msg;
+}
+
+async function _l2_onFileChange(event) {
+    _l2_fileBuffer = null;
+    _l2_csvText    = null;
+    window.AppState.logic2.tableRows = null;
+
+    const files = event.target.files;
+    if (!files || files.length === 0) return;
+
+    if (files.length > 1) {
+        _l2_log(`Logic 2: Processing ${files.length} multiple CSV files...`);
+        const { tablesData, tablesList } = await window.CSVAdapter.parseMultiple(files);
+        window.AppState.logic2.tablesData = tablesData;
+        window.AppState.logic2.inputFilename = 'multiple_csv_files';
+
+        _l2_log('Logic 2: Loaded multiple CSVs. Ready to Convert.');
+        return;
+    }
+
+    const file = files[0];
+    const name = file.name.toLowerCase();
+
+    if (window.AccessAdapter.isAccessFile(file.name)) {
+        _l2_log('Logic 2: Reading Access file: ' + file.name);
+        _l2_fileBuffer = await file.arrayBuffer();
+        _l2_log('Logic 2: ACCDB/MDB file buffered. Ready to Convert.');
+    } else if (name.endsWith('.csv')) {
+        _l2_log('Logic 2: CSV file selected: ' + file.name);
+        _l2_csvText = await file.text();
+        const rows = window.CSVAdapter.parse(_l2_csvText);
+        if (rows.length > 0) {
+            window.AppState.logic2.tableRows = rows;
+            window.AppState.logic2.inputFilename = file.name;
+            _l2_log('Logic 2: CSV loaded: ' + rows.length + ' row(s).');
+        }
+    }
+}
+
+async function _l2_onCiiChange(event) {
+    window.AppState.logic2.baseCiiText = null;
+    const file = event.target.files[0];
+    if (!file) return;
+    window.AppState.logic2.baseCiiText = await file.text();
+    _l2_log('Logic 2: Base CII loaded: ' + file.name);
+}
+
+// When Convert is clicked, extract ACCDB rows into window._l2_tableRows then call PyScript handler
+async function _l2_onConvertClick() {
+    _l2_setStatus('processing', '');
+    const fileInput = document.getElementById('l2-upload');
+    if (!fileInput.files || fileInput.files.length === 0) {
+        _l2_setStatus('processing', 'No file selected.');
+        _l2_log('Logic 2 ERROR: No input file selected.');
+        return;
+    }
+
+    const tableName = document.getElementById('l2-setting-table-name').value.trim()
+                      || window.ACCESS_IMPORT_CONFIG.defaultTable;
+
+    if (fileInput.files.length > 1) {
+        // Find the first table that has data (or try to find ELEMENT_DATA)
+        let foundTable = null;
+        for (const [tName, data] of Object.entries(window.AppState.logic2.tablesData || {})) {
+            if (tName.toUpperCase().includes('ELEMENT_DATA') || tName === tableName) {
+                foundTable = tName;
+                break;
+            }
+        }
+        if (!foundTable) {
+            const tables = Object.keys(window.AppState.logic2.tablesData || {});
+            if (tables.length > 0) foundTable = tables[0];
+        }
+
+        if (!foundTable || !window.AppState.logic2.tablesData[foundTable]) {
+            _l2_log(`Logic 2 ERROR: No valid data table loaded from selected CSVs.`);
+            return;
+        }
+        window.AppState.logic2.tableRows = window.AppState.logic2.tablesData[foundTable];
+        _l2_log(`Logic 2: Selected ${window.AppState.logic2.tableRows.length} row(s) from "${foundTable}" CSV.`);
+    } else {
+        const file = fileInput.files[0];
+        const name = file.name.toLowerCase();
+
+        if (window.AccessAdapter.isAccessFile(file.name)) {
+            if (!_l2_fileBuffer) {
+                _l2_log('Logic 2 ERROR: Buffer not loaded. Re-select the file.');
+                return;
+            }
+            try {
+                const response = await window.AccessAdapter.parseAccessTables(_l2_fileBuffer, { tableName }, { name: file.name, size: file.size }, 'l2', (msg) => {
+                    _l2_setStatus('processing', msg);
+                    _l2_log(`Logic 2 Status: ${msg}`);
+                });
+                window.AppState.logic2.tableRows = response.tablesData[tableName];
+                window.AppState.logic2.inputFilename = file.name;
+                _l2_log('Logic 2: Extracted ' + window.AppState.logic2.tableRows.length + ' row(s) from "' + tableName + '".');
+            } catch (e) {
+                _l2_log('Logic 2 ERROR: ' + e.message);
+                _l2_setStatus('processing', 'Failed: ' + e.message);
+                return;
+            }
+        } else if (name.endsWith('.csv')) {
+            if (!window.AppState.logic2.tableRows) {
+                _l2_log('Logic 2 ERROR: CSV not loaded. Re-select the file.');
+                return;
+            }
+            window.AppState.logic2.inputFilename = file.name;
+        }
+    }
+
+    // Trigger PyScript convert (dispatched as custom event)
+    document.dispatchEvent(new CustomEvent('l2-convert'));
+}
+
+function _l2_onExportIntermediateClick() {
+    document.dispatchEvent(new CustomEvent('l2-export-intermediate'));
+}
+
+function _l2_onApplySettingsClick() {
+    _l2_setStatus('settings', 'Settings applied.');
+    _l2_log('Logic 2 settings updated.');
+}
+
+// ================================================================
+// Logic 1 JS helpers
+// ================================================================
+let _l1_fileBuffer = null;
+let _l1_csvText    = null;
+
+function _l1_log(msg) {
+    const logEl = document.getElementById('status-logs');
+    if (logEl) {
+        const div = document.createElement('div');
+        div.className = 'py-1 px-2';
+        div.textContent = msg;
+        logEl.appendChild(div);
+        logEl.scrollTop = logEl.scrollHeight;
+    }
+}
+
+function _l1_setStatus(panel, msg) {
+    const el = document.getElementById('l1-status-' + panel);
+    if (el) el.textContent = msg;
+}
+
+async function _l1_onFileChange(event) {
+    _l1_fileBuffer = null; _l1_csvText = null;
+    window.AppState.logic1.elemRows = null;
+
+    const files = event.target.files;
+    if (!files || files.length === 0) return;
+    const statusEl = document.getElementById('l1-table-status');
+
+    if (files.length > 1) {
+        _l1_log(`Logic 1: Processing ${files.length} multiple CSV files...`);
+        const { tablesData } = await window.CSVAdapter.parseMultiple(files);
+
+        let elemTableKey = Object.keys(tablesData).find(k => k.toUpperCase().includes('ELEMENT_DATA')) || Object.keys(tablesData)[0];
+        let bendTableKey = Object.keys(tablesData).find(k => k.toUpperCase().includes('BEND'));
+        let restTableKey = Object.keys(tablesData).find(k => k.toUpperCase().includes('RESTRAINT') || k.toUpperCase() === 'RST_');
+        let rigidTableKey = Object.keys(tablesData).find(k => k.toUpperCase().includes('RIGID'));
+        let sifTableKey = Object.keys(tablesData).find(k => k.toUpperCase().includes('SIF'));
+
+        if (tablesData[elemTableKey] && tablesData[elemTableKey].length > 0) {
+            window.AppState.logic1.elemRows = tablesData[elemTableKey];
+            if (bendTableKey) window.AppState.logic1.bendRows = tablesData[bendTableKey];
+            if (restTableKey) window.AppState.logic1.restRows = tablesData[restTableKey];
+            if (rigidTableKey) window.AppState.logic1.rigidRows = tablesData[rigidTableKey];
+            if (sifTableKey) window.AppState.logic1.sifRows = tablesData[sifTableKey];
+
+            window.AppState.logic1.inputFilename = elemTableKey + '.csv';
+            if (statusEl) { statusEl.textContent = `CSV Bundle Loaded: ${window.AppState.logic1.elemRows.length} elements from ${elemTableKey}`; statusEl.classList.remove('hidden'); }
+            _l1_log(`Logic 1: Loaded ${window.AppState.logic1.elemRows.length} elements and aux data from multiple files selection`);
+        } else {
+             _l1_log('Logic 1 ERROR: No valid element data found in uploaded files.');
+        }
+        return;
+    }
+
+    const file = files[0];
+    const name = file.name.toLowerCase();
+
+    if (window.AccessAdapter.isAccessFile(file.name)) {
+        _l1_fileBuffer = await file.arrayBuffer();
+        try {
+            const tableNames = ['INPUT_BASIC_ELEMENT_DATA', 'INPUT_BENDS', 'INPUT_RESTRAINTS', 'INPUT_RIGIDS', 'INPUT_SIFTEES'];
+            const response = await window.AccessAdapter.parseAccessTables(_l1_fileBuffer, { tables: tableNames }, { name: file.name, size: file.size }, 'l1', (msg) => {
+                if (statusEl) { statusEl.textContent = `Status: ${msg}`; statusEl.classList.remove('hidden'); }
+                _l1_log(`Logic 1 Status: ${msg}`);
+            });
+            window.AppState.logic1.elemRows = response.tablesData['INPUT_BASIC_ELEMENT_DATA'] || [];
+            window.AppState.logic1.bendRows = response.tablesData['INPUT_BENDS'] || [];
+            window.AppState.logic1.restRows = response.tablesData['INPUT_RESTRAINTS'] || [];
+            window.AppState.logic1.rigidRows = response.tablesData['INPUT_RIGIDS'] || [];
+            window.AppState.logic1.sifRows = response.tablesData['INPUT_SIFTEES'] || [];
+            window.AppState.logic1.inputFilename = file.name;
+            if (statusEl) { statusEl.textContent = 'ACCDB loaded: ' + window.AppState.logic1.elemRows.length + ' elements'; statusEl.classList.remove('hidden'); }
+            _l1_log('Logic 1: Loaded ' + window.AppState.logic1.elemRows.length + ' elements from ' + file.name);
+        } catch(e) {
+            _l1_log('Logic 1 ERROR: ' + e.message);
+            if (statusEl) { statusEl.textContent = 'Error: ' + e.message; statusEl.classList.remove('hidden'); }
+        }
+    } else if (name.endsWith('.csv')) {
+        _l1_csvText = await file.text();
+        const rows = window.CSVAdapter.parse(_l1_csvText);
+        if (rows.length > 0) {
+            window.AppState.logic1.elemRows = rows;
+            window.AppState.logic1.inputFilename = file.name;
+            if (statusEl) { statusEl.textContent = 'Universal CSV loaded: ' + rows.length + ' rows'; statusEl.classList.remove('hidden'); }
+            _l1_log('Logic 1: Universal CSV loaded - ' + rows.length + ' rows');
+        }
+    }
+}
+
+async function _l1_onConvertClick() {
+    _l1_setStatus('processing', '');
+    if (!window.AppState.logic1.elemRows) { _l1_log('Logic 1 ERROR: No file loaded.'); return; }
+    document.dispatchEvent(new CustomEvent('l1-convert'));
+}
+
+function _l1_onExportIntermediateClick() {
+    document.dispatchEvent(new CustomEvent('l1-export-intermediate'));
+}
+
+function _l1_onApplySettingsClick() {
+    _l1_setStatus('settings', 'Settings applied.');
+    _l1_log('Logic 1 settings updated.');
+}
+
+// ================================================================
+// Logic 4 JS helpers — 5-table ACCDB extraction
+// ================================================================
+let _l4_fileBuffer = null;
+let _l4_csvText    = null;
+
+const L4_TABLES = [
+    ['INPUT_BASIC_ELEMENT_DATA', 'elemRows'],
+    ['INPUT_BENDS',              'bendRows'],
+    ['INPUT_RESTRAINTS',         'restRows'],
+    ['INPUT_RIGIDS',             'rigidRows'],
+    ['INPUT_SIFTEES',            'sifRows'],
+];
+
+function _l4_log(msg) {
+    const logEl = document.getElementById('status-logs');
+    if (logEl) {
+        const div = document.createElement('div');
+        div.className = 'py-1 px-2';
+        div.textContent = msg;
+        logEl.appendChild(div);
+        logEl.scrollTop = logEl.scrollHeight;
+    }
+}
+
+function _l4_setStatus(panel, msg) {
+    const el = document.getElementById('l4-status-' + panel);
+    if (el) el.textContent = msg;
+}
+
+async function _l4_onFileChange(event) {
+    // Reset all table globals
+    L4_TABLES.forEach(([, wk]) => { window.AppState.logic4[wk] = null; });
+    _l4_fileBuffer = null; _l4_csvText = null;
+
+    const files = event.target.files;
+    if (!files || files.length === 0) return;
+    const statusEl = document.getElementById('l4-table-status');
+
+    if (files.length > 1) {
+        _l4_log(`Logic 4: Processing ${files.length} multiple CSV files...`);
+        const { tablesData } = await window.CSVAdapter.parseMultiple(files);
+        const counts = {};
+        for (const [tbl, wk] of L4_TABLES) {
+            // Find closest match in uploaded CSV filenames
+            const fileKey = Object.keys(tablesData).find(k => k.toUpperCase().includes(tbl) || tbl.includes(k.toUpperCase()));
+            const rows = fileKey ? tablesData[fileKey] : [];
+            window.AppState.logic4[wk] = rows;
+            counts[tbl] = rows.length;
+        }
+        window.AppState.logic4.inputFilename = 'multiple_csv_files';
+        const statusText = [
+            'Elements: ' + (counts['INPUT_BASIC_ELEMENT_DATA'] || 0),
+            'Bends: '    + (counts['INPUT_BENDS'] || 0),
+            'Restraints: ' + (counts['INPUT_RESTRAINTS'] || 0),
+            'Rigids: '   + (counts['INPUT_RIGIDS'] || 0),
+            'SIFs: '     + (counts['INPUT_SIFTEES'] || 0)
+        ].join(' | ');
+        if (statusEl) { statusEl.textContent = statusText; statusEl.classList.remove('hidden'); }
+        _l4_log('Logic 4: ' + statusText);
+        return;
+    }
+
+    const file = files[0];
+    const name = file.name.toLowerCase();
+
+    if (window.AccessAdapter.isAccessFile(file.name)) {
+        _l4_fileBuffer = await file.arrayBuffer();
+        try {
+            const tableNames = L4_TABLES.map(t => t[0]);
+            const response = await window.AccessAdapter.parseAccessTables(_l4_fileBuffer, { tables: tableNames }, { name: file.name, size: file.size }, 'l4', (msg) => {
+                if (statusEl) { statusEl.textContent = `Status: ${msg}`; statusEl.classList.remove('hidden'); }
+                _l4_log(`Logic 4 Status: ${msg}`);
+            });
+            const counts = {};
+            for (const [tbl, wk] of L4_TABLES) {
+                const rows = response.tablesData[tbl] || [];
+                window.AppState.logic4[wk] = rows;
+                counts[tbl] = rows.length;
+            }
+            window.AppState.logic4.inputFilename = file.name;
+            const statusText = [
+                'Elements: ' + (counts['INPUT_BASIC_ELEMENT_DATA'] || 0),
+                'Bends: '    + (counts['INPUT_BENDS'] || 0),
+                'Restraints: ' + (counts['INPUT_RESTRAINTS'] || 0),
+                'Rigids: '   + (counts['INPUT_RIGIDS'] || 0),
+                'SIFs: '     + (counts['INPUT_SIFTEES'] || 0)
+            ].join(' | ');
+            if (statusEl) { statusEl.textContent = statusText; statusEl.classList.remove('hidden'); }
+            _l4_log('Logic 4: ' + statusText);
+        } catch(e) {
+            _l4_log('Logic 4 ERROR loading Access file: ' + e.message);
+            if (statusEl) { statusEl.textContent = 'Error: ' + e.message; statusEl.classList.remove('hidden'); }
+        }
+
+    } else if (name.endsWith('.csv')) {
+        _l4_csvText = await file.text();
+        const rows = window.CSVAdapter.parse(_l4_csvText);
+        if (rows.length > 0) {
+            window.AppState.logic4.elemRows = rows;  // universal CSV — pipeline.py reconstructs aux from BND_/RST_/etc
+            window.AppState.logic4.inputFilename = file.name;
+            if (statusEl) { statusEl.textContent = 'Universal CSV: ' + rows.length + ' rows (aux rows will be reconstructed from BND_/RST_/RGD_/SIF_ columns)'; statusEl.classList.remove('hidden'); }
+            _l4_log('Logic 4: Universal CSV loaded — ' + rows.length + ' rows');
+        }
+    }
+}
+
+async function _l4_onCiiChange(event) {
+    window.AppState.logic4.baseCiiText = null;
+    const file = event.target.files[0];
+    if (!file) return;
+    window.AppState.logic4.baseCiiText = await file.text();
+    _l4_log('Logic 4: Base CII loaded: ' + file.name);
+}
+
+async function _l4_onConvertClick() {
+    _l4_setStatus('processing', '');
+    if (!window.AppState.logic4.elemRows) { _l4_log('Logic 4 ERROR: No file loaded.'); return; }
+    document.dispatchEvent(new CustomEvent('l4-convert'));
+}
+
+function _l4_onExportIntermediateClick() {
+    document.dispatchEvent(new CustomEvent('l4-export-intermediate'));
+}
+
+function _l4_onApplySettingsClick() {
+    _l4_setStatus('settings', 'Settings applied.');
+    _l4_log('Logic 4 settings updated.');
+}
+
+// ---- Wire up Logic 3 event listeners on DOM ready ----
+// Also reveal #app immediately — DO NOT wait for PyScript (CII Tools will activate when Python loads)
+document.addEventListener('DOMContentLoaded', () => {
+    document.getElementById('loading').classList.add('hidden');
+    document.getElementById('app').classList.remove('hidden');
+
+    document.getElementById('l3-upload').addEventListener('change', _l3_onFileChange);
+    document.getElementById('l3-btn-convert').addEventListener('click', _l3_convert);
+    document.getElementById('l3-btn-export-intermediate').addEventListener('click', _l3_exportIntermediate);
+    document.getElementById('l3-btn-apply-settings').addEventListener('click', _l3_applySettings);
+
+    // Logic 2 listeners
+    document.getElementById('l2-upload').addEventListener('change', _l2_onFileChange);
+    document.getElementById('l2-upload-cii').addEventListener('change', _l2_onCiiChange);
+    document.getElementById('l2-btn-convert').addEventListener('click', _l2_onConvertClick);
+    document.getElementById('l2-btn-export-intermediate').addEventListener('click', _l2_onExportIntermediateClick);
+    document.getElementById('l2-btn-apply-settings').addEventListener('click', _l2_onApplySettingsClick);
+
+    // Logic 1 listeners
+    document.getElementById('l1-upload').addEventListener('change', _l1_onFileChange);
+    document.getElementById('l1-btn-convert').addEventListener('click', _l1_onConvertClick);
+    document.getElementById('l1-btn-export-intermediate').addEventListener('click', _l1_onExportIntermediateClick);
+    document.getElementById('l1-btn-apply-settings').addEventListener('click', _l1_onApplySettingsClick);
+
+    // Logic 4 listeners
+    document.getElementById('l4-upload').addEventListener('change', _l4_onFileChange);
+    document.getElementById('l4-upload-cii').addEventListener('change', _l4_onCiiChange);
+    document.getElementById('l4-btn-convert').addEventListener('click', _l4_onConvertClick);
+    document.getElementById('l4-btn-export-intermediate').addEventListener('click', _l4_onExportIntermediateClick);
+    document.getElementById('l4-btn-apply-settings').addEventListener('click', _l4_onApplySettingsClick);
+});
+
+
+// ================================================================
+// Per-logic Debug Inspectors
+// ================================================================
+
+// ── Logic 1: JS global inspector ──────────────────────────────────────────────
+function _l1_inspectJS() {
+    const out = document.getElementById('l1-debug-js-out');
+    const rows = window.AppState.logic1.elemRows;
+    const info = ['=== Logic 1 JS Globals ==='];
+    info.push('inputFilename : ' + (window.AppState.logic1.inputFilename || 'null'));
+    info.push('elemRows      : ' + (rows ? rows.length + ' rows' : 'null'));
+    if (rows && rows.length > 0) {
+        const r = rows[0];
+        const keys = (typeof r.to_py === 'function') ? Object.keys(r.to_py()) : Object.keys(r);
+        info.push('');
+        info.push('--- Column Keys (' + keys.length + ') ---');
+        info.push(keys.join('  '));
+        info.push('');
+        info.push('--- Row 0 Sample Values ---');
+        for (const k of ['FROM_NODE','TO_NODE','DELTA_X','DELTA_Y','DELTA_Z','DIAMETER','WALL_THICK','BEND_PTR','REST_PTR','RIGID_PTR','INT_PTR','MATERIAL_NUM']) {
+            const v = (r[k] !== undefined) ? r[k] : '(missing)';
+            info.push(k.padEnd(18) + ': ' + v);
+        }
+    }
+    out.textContent = info.join('\n');
+}
+
+// ── Logic 2: JS global inspector ──────────────────────────────────────────────
+function _l2_inspectJS() {
+    const out = document.getElementById('l2-debug-js-out');
+    const rows = window.AppState.logic2.tableRows;
+    const ciiText = window.AppState.logic2.baseCiiText;
+    const info = ['=== Logic 2 JS Globals ==='];
+    info.push('inputFilename : ' + (window.AppState.logic2.inputFilename || 'null'));
+    info.push('tableRows     : ' + (rows ? rows.length + ' rows' : 'null'));
+    info.push('baseCiiText   : ' + (ciiText ? ciiText.length + ' chars' : 'null'));
+    if (rows && rows.length > 0) {
+        const r = rows[0];
+        const keys = (typeof r.to_py === 'function') ? Object.keys(r.to_py()) : Object.keys(r);
+        info.push('');
+        info.push('--- Column Keys (' + keys.length + ') ---');
+        info.push(keys.join('  '));
+        info.push('');
+        info.push('--- Row 0 Sample Values ---');
+        for (const k of ['FROM_NODE','TO_NODE','DIAMETER','WALL_THICK','BEND_PTR','REST_PTR','RIGID_PTR','INT_PTR']) {
+            info.push(k.padEnd(18) + ': ' + ((r[k] !== undefined) ? r[k] : '(missing)'));
+        }
+    }
+    if (ciiText) {
+        info.push('');
+        info.push('--- Base CII Preview (200 chars) ---');
+        info.push(ciiText.substring(0, 200));
+    }
+    out.textContent = info.join('\n');
+}
+
+// ── Logic 3: JS inspector + single-row test ────────────────────────────────────
+function _l3_inspectJS() {
+    const out = document.getElementById('l3-debug-js-out');
+    const tableRows = window.AppState.logic3.tableRows;
+    const info = ['=== Logic 3 JS State ==='];
+    info.push('_l3_fileBuffer  : ' + (_l3_fileBuffer ? _l3_fileBuffer.byteLength + ' bytes' : 'null'));
+    info.push('_l3_csvText     : ' + (_l3_csvText ? _l3_csvText.length + ' chars' : 'null'));
+    info.push('tableRows   : ' + (tableRows ? tableRows.length + ' rows' : 'null'));
+    info.push('');
+    info.push('--- Logic3_BENCHMARK_BLOCKS ---');
+    info.push(typeof Logic3_BENCHMARK_BLOCKS !== 'undefined'
+        ? 'Loaded — ' + Object.keys(Logic3_BENCHMARK_BLOCKS).length + ' keys: ' + Object.keys(Logic3_BENCHMARK_BLOCKS).join(', ')
+        : 'NOT LOADED — check generate_final.js and benchmark_data.js');
+    if (tableRows && tableRows.length > 0) {
+        const r = tableRows[0];
+        info.push('');
+        info.push('--- Column Keys (' + Object.keys(r).length + ') ---');
+        info.push(Object.keys(r).join('  '));
+        info.push('');
+        info.push('--- Row 0 Sample Values ---');
+        for (const k of ['ELEMENTID','FROM_NODE','TO_NODE','DIAMETER','WALL_THICK','BEND_PTR','REST_PTR','RIGID_PTR','INT_PTR']) {
+            info.push(k.padEnd(18) + ': ' + (r[k] !== undefined ? r[k] : '(missing)'));
+        }
+    }
+    out.textContent = info.join('\n');
+}
+
+function _l3_testGenerate() {
+    const out = document.getElementById('l3-debug-js-out');
+    if (!window.AppState.logic3.tableRows || window.AppState.logic3.tableRows.length === 0) {
+        out.textContent = 'ERROR: No rows loaded. Load a file in the Processing tab first.';
+        return;
+    }
+    if (typeof Logic3_generateFinal === 'undefined') {
+        out.textContent = 'ERROR: Logic3_generateFinal not defined. Check generate_final.js loaded correctly.';
+        return;
+    }
+    try {
+        const result = Logic3_generateFinal([window.AppState.logic3.tableRows[0]], Logic3_BENCHMARK_BLOCKS);
+        out.textContent = '=== Single Row CII Output (first 900 chars) ===\n' + result.substring(0, 900);
+    } catch(e) {
+        out.textContent = 'ERROR during test generation:\n' + e.message + '\n' + (e.stack || '');
+    }
+}
+
+// ── Access -> CSV Converter Tab Logic ─────────────────────────────────────────
+
+let zipBlob = null;
+
+function logAccdb(msg, cls){
+    const lb = document.getElementById("lb");
+    if(!lb) return;
+    lb.style.display="block";
+    const p=document.createElement("p");
+    if(cls) p.className=cls;
+    p.textContent=msg;
+    lb.appendChild(p);
+    lb.scrollTop=lb.scrollHeight;
+}
+function setAccdbProgress(pct, label){
+    const pw = document.getElementById("pw"), pf = document.getElementById("pf"), pl = document.getElementById("pl");
+    if(!pw || !pf || !pl) return;
+    pw.style.display="block";
+    pf.style.width=pct+"%";
+    pl.textContent=label;
+}
+function escCSV(v){
+    if(v===null||v===undefined)return '""';
+    if(v instanceof Date)return '"'+v.toISOString().replace(/"/g,'""')+'"';
+    return '"'+String(v).replace(/"/g,'""')+'"';
+}
+function safeName(s){return s.replace(/[\\/:*?"<>|]/g,"_");}
+
+async function processAccdbFile(file){
+    const dz = document.getElementById("dz"), sum = document.getElementById("sum"), dlBtn = document.getElementById("dlBtn"), rst = document.getElementById("rst");
+    const ext = file.name.split(".").pop().toLowerCase();
+    if(!["accdb","mdb"].includes(ext)){
+        logAccdb("Please select a .accdb or .mdb file.","text-red-400");return;
+    }
+    if(dz) dz.style.display="none";
+    logAccdb("File : "+file.name,"text-blue-300");
+    logAccdb("Size : "+(file.size/1024).toFixed(1)+" KB","text-blue-300");
+    setAccdbProgress(5,"Reading file...");
+
+    if(!window.mdbReader || !window.Buffer){
+        logAccdb("Bundle load error — libraries not ready","text-red-400");
+        if(rst) rst.style.display="block";return;
+    }
+
+    let arrayBuf;
+    try{arrayBuf=await file.arrayBuffer();}
+    catch(e){logAccdb("Could not read file: "+e.message,"text-red-400");return;}
+
+    setAccdbProgress(15,"Parsing database...");
+    let reader;
+    try{
+        const buf = window.Buffer.from(new Uint8Array(arrayBuf));
+        reader = new window.mdbReader.Database(buf);
+    }
+    catch(e){
+        logAccdb("Failed to parse database: "+e.message,"text-red-400");
+        logAccdb("  - Password-protected files are not supported","text-red-400");
+        logAccdb("  - File may be corrupted or unsupported version","text-red-400");
+        if(rst) rst.style.display="block";return;
+    }
+
+    let tables;
+    try{tables=reader.getTableNames({systemTables:false});}
+    catch(_){
+        try{tables=reader.getTableNames();}
+        catch(e){logAccdb("Cannot read table list: "+e.message,"text-red-400");return;}
+    }
+
+    if(!tables||tables.length===0){
+        logAccdb("No user tables found.","text-yellow-300");
+        if(rst) rst.style.display="block";return;
+    }
+
+    logAccdb("\nFound "+tables.length+" table(s)","text-blue-300");
+    logAccdb("------------------------------------------------","text-blue-300");
+
+    const zip = new window.JSZip();
+    const folderName = safeName(file.name.replace(/\.[^.]+$/,""));
+    const folder = zip.folder(folderName);
+    let nOK=0, nEmpty=0, nFail=0;
+
+    for(let i=0;i<tables.length;i++){
+        const tbl=tables[i];
+        setAccdbProgress(15+Math.round((i/tables.length)*75),(i+1)+"/"+tables.length+": "+tbl);
+        try{
+            const table=reader.getTable(tbl);
+            const cols=table.getColumnNames();
+            const rows=table.getData();
+            const lines=[cols.map(escCSV).join(",")];
+            for(const row of rows)lines.push(cols.map(c=>escCSV(row[c])).join(","));
+            folder.file(safeName(tbl)+".csv",lines.join("\r\n")+"\r\n");
+            if(rows.length===0){logAccdb("EMPTY ["+tbl+"]","text-yellow-300");nEmpty++;}
+            else{logAccdb("OK    ["+rows.length+" rows]: "+tbl,"text-green-400");nOK++;}
+        }catch(e){logAccdb("FAIL  ["+tbl+"]: "+e.message,"text-red-400");nFail++;}
+        await new Promise(r=>setTimeout(r,0));
+    }
+
+    setAccdbProgress(95,"Building ZIP...");
+    zipBlob=await zip.generateAsync({
+        type:"blob",compression:"DEFLATE",compressionOptions:{level:6}
+    });
+    setAccdbProgress(100,"Done!");
+    logAccdb("------------------------------------------------","text-blue-300");
+    logAccdb("Complete: "+nOK+" with data  |  "+nEmpty+" empty  |  "+nFail+" failed","text-green-400");
+
+    if(sum) {
+        sum.style.display="flex";
+        sum.innerHTML=
+            '<span class="px-3 py-1 rounded-full text-xs font-semibold bg-green-100 text-green-800">\u2705 '+nOK+' with data</span>'+
+            (nEmpty?'<span class="px-3 py-1 rounded-full text-xs font-semibold bg-yellow-100 text-yellow-800">\u26a0\ufe0f '+nEmpty+' empty</span>':'')+
+            (nFail ?'<span class="px-3 py-1 rounded-full text-xs font-semibold bg-red-100 text-red-800">\u274c '+nFail+' failed</span>':'');
+    }
+
+    if(dlBtn) {
+        dlBtn.textContent="\u2b07\ufe0f Download "+folderName+".zip";
+        dlBtn.style.display="block";
+        dlBtn.onclick=()=>{
+            const a=document.createElement("a");
+            a.href=URL.createObjectURL(zipBlob);
+            a.download=folderName+".zip";
+            a.click();
+            URL.revokeObjectURL(a.href);
+        };
+    }
+    if(rst) rst.style.display="block";
+}
+
+function resetAccdbUI(){
+    const dz = document.getElementById("dz"), fi = document.getElementById("fi");
+    const pw = document.getElementById("pw"), pf = document.getElementById("pf");
+    const lb = document.getElementById("lb"), sum = document.getElementById("sum");
+    const dlBtn = document.getElementById("dlBtn"), rst = document.getElementById("rst");
+    zipBlob=null;
+    if(lb) {lb.innerHTML="";lb.style.display="none";}
+    if(sum) {sum.style.display="none";sum.innerHTML="";}
+    if(dlBtn) dlBtn.style.display="none";
+    if(pw) pw.style.display="none";
+    if(pf) pf.style.width="0%";
+    if(rst) rst.style.display="none";
+    if(dz) dz.style.display="block";
+    if(fi) fi.value="";
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+    const dz = document.getElementById("dz");
+    const fi = document.getElementById("fi");
+    if(dz) {
+        dz.addEventListener("dragover",e=>{e.preventDefault();dz.classList.add("border-blue-500", "bg-blue-50")});
+        dz.addEventListener("dragleave",()=>dz.classList.remove("border-blue-500", "bg-blue-50"));
+        dz.addEventListener("drop",e=>{
+            e.preventDefault();dz.classList.remove("border-blue-500", "bg-blue-50");
+            if(e.dataTransfer.files[0])processAccdbFile(e.dataTransfer.files[0]);
+        });
+    }
+    if(fi) {
+        fi.addEventListener("change",e=>{if(e.target.files[0])processAccdbFile(e.target.files[0])});
+    }
+});
+
+
+// ── Logic 4: JS global inspector ──────────────────────────────────────────────
+function _l4_inspectJS() {
+    const out = document.getElementById('l4-debug-js-out');
+    const elemRows = window.AppState.logic4.elemRows;
+    const info = ['=== Logic 4 JS Globals ==='];
+    info.push('inputFilename : ' + (window.AppState.logic4.inputFilename || 'null'));
+    info.push('elemRows      : ' + (elemRows ? elemRows.length + ' rows' : 'null'));
+    info.push('bendRows      : ' + (window.AppState.logic4.bendRows   ? window.AppState.logic4.bendRows.length   + ' rows' : 'null'));
+    info.push('restRows      : ' + (window.AppState.logic4.restRows   ? window.AppState.logic4.restRows.length   + ' rows' : 'null'));
+    info.push('rigidRows     : ' + (window.AppState.logic4.rigidRows  ? window.AppState.logic4.rigidRows.length  + ' rows' : 'null'));
+    info.push('sifRows       : ' + (window.AppState.logic4.sifRows    ? window.AppState.logic4.sifRows.length    + ' rows' : 'null'));
+    info.push('baseCiiText   : ' + (window.AppState.logic4.baseCiiText ? window.AppState.logic4.baseCiiText.length + ' chars' : 'null'));
+    if (elemRows && elemRows.length > 0) {
+        const r = elemRows[0];
+        const keys = (typeof r.to_py === 'function') ? Object.keys(r.to_py()) : Object.keys(r);
+        info.push('');
+        info.push('--- Element Column Keys (' + keys.length + ') ---');
+        info.push(keys.join('  '));
+        info.push('');
+        const hasBND = keys.includes('BND_RADIUS');
+        info.push('Universal CSV (BND_RADIUS present): ' + hasBND);
+        info.push('');
+        info.push('--- Row 0 Sample Values ---');
+        for (const k of ['FROM_NODE','TO_NODE','DIAMETER','BEND_PTR','REST_PTR','RIGID_PTR','INT_PTR','BND_RADIUS','RST_NODE_NUM','RGD_RIGID_WGT']) {
+            info.push(k.padEnd(20) + ': ' + (r[k] !== undefined ? r[k] : '(missing)'));
+        }
+    }
+    out.textContent = info.join('\n');
+}
+</script>
+
+
+<!-- PyScript Logic (CII Tools tab: parse/reconstruct) -->
+<script type="py">
+import asyncio
+import logging
+import pandas as pd
+from js import document, Blob, window, Uint8Array, URL
+from pyodide.ffi import create_proxy
+
+# --- CII Tools (Logic 3 round-trip) imports ---
+from serializer import CIIParser, ParserSettings, ParseContext
+from Logic2_serializer import CIISerializer, SerializerSettings
+from optimizer import reconstruct_from_csv
+
+# --- Logic 2 imports ---
+from Logic2_parser import CIIParser as L2_CIIParser, ParserSettings as L2_ParserSettings
+from Logic2_serializer import CIISerializer as L2_CIISerializer, SerializerSettings as L2_SerializerSettings
+from Logic2_importer import reconstruct_from_csv as L2_reconstruct_from_csv, get_boilerplate_cii_data as L2_get_boilerplate
+from Logic2_exporter import generate_custom_csv as L2_generate_custom_csv
+
+# --- Logic 1 imports ---
+from Logic1_export_cii import CaesarExporter as L1_Exporter
+from Logic1_exporter import generate_custom_csv as L1_generate_custom_csv
+
+# --- Logic 4 imports ---
+from Logic4_pipeline import build_hybrid_cii as L4_build_hybrid_cii, build_universal_csv as L4_build_universal_csv, load_universal_csv as L4_load_universal_csv
+
+# --- Inline generate_custom_csv ---
+# (The function was referenced but never defined anywhere in the project.
+#  This minimal version exports the key REL fields from parsed_data to a DataFrame.)
+def generate_custom_csv(parsed_data, _output_path=None):
+    REL_COLS = [
+        "FROM_NODE","TO_NODE","DELTA_X","DELTA_Y","DELTA_Z","DIAMETER",
+        "WALL_THICK","INSUL_THICK","CORR_ALLOW",
+        "TEMP_EXP_C1","TEMP_EXP_C2","TEMP_EXP_C3",
+        "TEMP_EXP_C4","TEMP_EXP_C5","TEMP_EXP_C6",
+        "PRESSURE1","PRESSURE2","PRESSURE3",
+        "MODULUS","POISSONS","PIPE_DENSITY",
+    ]
+    REL_IDX = [0,1,2,3,4,5, 6,7,8, 9,10,11, 12,13,14, 18,19,20, 27,28,29]
+    rows = []
+    for i, elem in enumerate(parsed_data.get("elements", [])):
+        rel = elem.get("REL", [])
+        row = {"ELEMENTID": i + 1}
+        for col, idx in zip(REL_COLS, REL_IDX):
+            row[col] = rel[idx] if idx < len(rel) else 0.0
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+def log_status(msg):
+    log_el = document.getElementById("status-logs")
+    line_div = document.createElement("div")
+    line_div.className = "py-1 px-2 hover:bg-gray-100"
+    if "[ERROR]" in msg:
+        line_div.className += " text-red-600 bg-red-50"
+    elif "[WARN]" in msg:
+        line_div.className += " text-yellow-600 bg-yellow-50"
+    else:
+        if " - [INFO] | " in msg:
+            parts = msg.split(" - [INFO] | ", 1)
+            line_div.innerHTML = (
+                f"<span class='text-gray-500'>{parts[0]}</span>"
+                f" - <span class='text-blue-600 font-semibold'>[INFO]</span>"
+                f" | <span>{parts[1]}</span>"
+            )
+        else:
+            line_div.innerText = msg
+    if line_div.innerHTML == "":
+        line_div.innerText = msg
+    log_el.appendChild(line_div)
+    log_el.scrollTop = log_el.scrollHeight
+
+    # Also forward ERRORs to JS error handler to show in console/debug panels
+    if "[ERROR]" in msg:
+        import sys
+        print(msg, file=sys.stderr)
+
+        # Fire diagnostic event to make sure it shows up in UI
+        import js
+        try:
+            err_msg = msg.replace("[ERROR]", "").strip()
+            detail = {"ts": js.Date.new().toISOString(), "outcome": "failure", "error": {"message": err_msg, "rawMessage": msg}}
+            event = js.CustomEvent.new('ACCESS_DIAGNOSTICS', {"detail": detail})
+            js.document.dispatchEvent(event)
+        except Exception:
+            pass
+
+def clear_logs(event):
+    document.getElementById("status-logs").innerHTML = ""
+
+async def read_file_content(file_obj, as_text=True):
+    if not file_obj:
+        return None
+    array_buffer = await file_obj.arrayBuffer()
+    bytes_arr = Uint8Array.new(array_buffer).to_py()
+    if as_text:
+        return bytes(bytes_arr).decode('latin-1')
+    return bytes(bytes_arr)
+
+def download_file(content, filename, mime_type="text/plain"):
+    blob = Blob.new([content], {"type": mime_type})
+    url = URL.createObjectURL(blob)
+    a = document.createElement("a")
+    a.href = url
+    a.download = filename
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+    URL.revokeObjectURL(url)
+
+# ----- Global state -----
+original_parsed_data = None
+current_cii_filename = "original.cii"
+
+# --- Logging interceptor ---
+class PyScriptLogHandler(logging.Handler):
+    def emit(self, record):
+        log_status(self.format(record))
+
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO)
+pyscript_handler = PyScriptLogHandler()
+pyscript_handler.setFormatter(logging.Formatter('%(asctime)s - [%(levelname)s] | %(message)s'))
+root_logger.addHandler(pyscript_handler)
+
+
+async def on_export_csv(event):
+    global original_parsed_data, current_cii_filename
+    log_status("Starting CSV Export...")
+
+    file_input = document.getElementById("upload-cii")
+    if not file_input.files or file_input.files.length == 0:
+        log_status("[ERROR] No .cii file selected.")
+        return
+
+    file_obj = file_input.files.item(0)
+    current_cii_filename = file_obj.name
+    content = await read_file_content(file_obj)
+
+    log_status("Parsing .cii file...")
+    settings = ParserSettings(n1_base=2000, is_data_matrix=False)
+    p = CIIParser(settings)
+    lines = [l.rstrip('\r') for l in content.split('\n')]
+    original_parsed_data = p.parse_lines(lines)
+    log_status(f"Parsed {len(original_parsed_data.get('elements', []))} elements.")
+
+    df = generate_custom_csv(original_parsed_data)
+    csv_string = df.to_csv(index=False)
+
+    out_name = current_cii_filename.replace('.CII', '.cii').replace('.cii', '_export.csv')
+    download_file(csv_string, out_name, "text/csv")
+    log_status(f"Downloaded: {out_name}")
+
+
+async def on_reconstruct(event):
+    global original_parsed_data, current_cii_filename
+    log_status("Starting Reconstruction...")
+
+    if original_parsed_data is None:
+        file_input = document.getElementById("upload-cii")
+        if file_input.files and file_input.files.length > 0:
+            file_obj = file_input.files.item(0)
+            current_cii_filename = file_obj.name
+            content = await read_file_content(file_obj)
+            settings = ParserSettings(n1_base=2000, is_data_matrix=False)
+            p = CIIParser(settings)
+            lines = [l.rstrip('\r') for l in content.split('\n')]
+            original_parsed_data = p.parse_lines(lines)
+            log_status("Original CII parsed successfully.")
+        else:
+            log_status("[WARN] No .cii file provided. Standalone reconstruction from CSV.")
+            current_cii_filename = "reconstructed.cii"
+
+    csv_input = document.getElementById("upload-csv")
+    if not csv_input.files or csv_input.files.length == 0:
+        log_status("[ERROR] No CSV file selected.")
+        return
+
+    csv_file_obj = csv_input.files.item(0)
+    csv_content = await read_file_content(csv_file_obj)
+
+    # optimizer.reconstruct_from_csv expects a file path — write to virtual FS
+    import io, os
+    csv_tmp = "/tmp/_recon_input.csv"
+    with open(csv_tmp, "w") as f:
+        f.write(csv_content)
+
+    original_parsed_data = reconstruct_from_csv(csv_tmp, original_parsed_data)
+    log_status(f"CSV applied. Serializing {len(original_parsed_data['elements'])} elements...")
+
+    use_dos = "\r\n" in csv_content
+    s_settings = SerializerSettings(use_dos_newlines=use_dos)
+    serializer = CIISerializer(s_settings)
+    gen_str = serializer.serialize(original_parsed_data)
+
+    out_name = "reconstructed_" + current_cii_filename
+    download_file(gen_str, out_name, "text/plain")
+    log_status(f"Downloaded: {out_name}")
+
+
+# ================================================================
+# Logic 2 PyScript handlers
+# ================================================================
+
+# Global state for Logic 2
+_l2_parsed_data = None
+
+def _l2_rows_to_df(js_rows):
+    """Convert a JS array of plain objects to a pandas DataFrame."""
+    if js_rows is None:
+        return None
+    py_rows = []
+    for r in js_rows:
+        py_rows.append({k: r[k] for k in js_rows[0].to_py().keys()} if hasattr(r, 'to_py') else dict(r))
+    if not py_rows:
+        return None
+    return pd.DataFrame(py_rows)
+
+def _l2_js_rows_to_df(js_rows):
+    """Safely convert PyScript JS proxy array to pandas DataFrame."""
+    rows = []
+    for item in js_rows:
+        d = item.to_py() if hasattr(item, 'to_py') else {}
+        rows.append(d)
+    return pd.DataFrame(rows) if rows else None
+
+async def on_l2_convert(event):
+    global _l2_parsed_data
+    log_status("Logic 2: Starting conversion...")
+
+    # Get rows from JS global
+    js_rows = window.AppState.logic2.tableRows
+    if js_rows is None:
+        log_status("[ERROR] Logic 2: No input data. Load an ACCDB or CSV in the Processing tab.")
+        return
+
+    try:
+        df = _l2_js_rows_to_df(js_rows)
+        if df is None or len(df) == 0:
+            log_status("[ERROR] Logic 2: Extracted 0 rows from input.")
+            return
+        log_status(f"Logic 2: {len(df)} rows loaded into DataFrame.")
+    except Exception as e:
+        log_status(f"[ERROR] Logic 2: Failed to convert JS rows to DataFrame: {e}")
+        return
+
+    # Parse optional base CII
+    base_data = None
+    js_cii_text = window.AppState.logic2.baseCiiText
+    if js_cii_text:
+        try:
+            n1 = int(document.getElementById("l2-setting-n1").value or 2000)
+            settings = L2_ParserSettings(n1_base=n1, is_data_matrix=False)
+            p = L2_CIIParser(settings)
+            lines = [l.rstrip('\r') for l in js_cii_text.split('\n')]
+            base_data = p.parse_lines(lines)
+            log_status(f"Logic 2: Base CII parsed — {len(base_data.get('elements', []))} elements.")
+        except Exception as e:
+            log_status(f"[WARN] Logic 2: Could not parse base CII ({e}). Using boilerplate skeleton.")
+            base_data = None
+
+    # Write DataFrame to temp CSV then call reconstruct_from_csv
+    try:
+        csv_tmp = "/tmp/_l2_input.csv"
+        df.to_csv(csv_tmp, index=False)
+        merged = L2_reconstruct_from_csv(csv_tmp, base_data)
+        _l2_parsed_data = merged
+        log_status(f"Logic 2: Merged {len(merged.get('elements', []))} elements.")
+    except Exception as e:
+        log_status(f"[ERROR] Logic 2: reconstruct_from_csv failed: {e}")
+        return
+
+    # Serialize to CII
+    try:
+        use_crlf = document.getElementById("l2-setting-crlf").value == "true"
+        s_settings = L2_SerializerSettings(use_dos_newlines=use_crlf)
+        serializer = L2_CIISerializer(s_settings)
+        cii_text = serializer.serialize(merged)
+    except Exception as e:
+        log_status(f"[ERROR] Logic 2: Serialization failed: {e}")
+        return
+
+    # Download
+    raw_name = str(window.AppState.logic2.inputFilename or "output")
+    import re as _re
+    out_name = _re.sub(r'\.(accdb|mdb|csv)$', '', raw_name, flags=_re.IGNORECASE) + '_logic2.cii'
+    download_file(cii_text, out_name, "text/plain")
+    log_status(f"Logic 2: SUCCESS — Downloaded {out_name} ({len(cii_text)} bytes).")
+    el = document.getElementById("l2-status-processing")
+    if el: el.textContent = "Downloaded " + out_name
+
+
+async def on_l2_export_intermediate(event):
+    global _l2_parsed_data
+    log_status("Logic 2: Exporting intermediate CSV...")
+
+    if _l2_parsed_data is None:
+        log_status("[ERROR] Logic 2: No parsed data. Run Convert first.")
+        el = document.getElementById("l2-status-intermediate")
+        if el: el.textContent = "Run Convert first."
+        return
+
+    try:
+        csv_out = "/tmp/_l2_intermediate.csv"
+        df = L2_generate_custom_csv(_l2_parsed_data, csv_out)
+        csv_str = df.to_csv(index=False)
+    except Exception as e:
+        log_status(f"[ERROR] Logic 2: Export failed: {e}")
+        return
+
+    out_name = "logic2_intermediate.csv"
+    download_file(csv_str, out_name, "text/csv")
+    log_status(f"Logic 2: Intermediate CSV exported — {len(df)} rows.")
+    el_s = document.getElementById("l2-status-intermediate")
+    if el_s: el_s.textContent = "Downloaded " + out_name
+
+    # Preview
+    lines = csv_str.split('\n')
+    preview = '\n'.join(lines[:6])
+    pre_el = document.getElementById("l2-csv-preview")
+    if pre_el: pre_el.textContent = preview
+    cont = document.getElementById("l2-csv-preview-container")
+    if cont: cont.classList.remove("hidden")
+
+
+# Bind Logic 2 custom events from JS
+from pyodide.ffi import create_proxy as _cp
+document.addEventListener("l2-convert", _cp(on_l2_convert))
+document.addEventListener("l2-export-intermediate", _cp(on_l2_export_intermediate))
+
+
+# ================================================================
+# Logic 1 PyScript handlers
+# ================================================================
+_l1_parsed_data = None
+
+def _js_rows_to_list_of_dicts(js_rows):
+    """Convert JS proxy array to Python list of dicts."""
+    result = []
+    for item in js_rows:
+        d = item.to_py() if hasattr(item, 'to_py') else {}
+        result.append(d)
+    return result
+
+async def on_l1_convert(event):
+    global _l1_parsed_data
+    log_status("Logic 1: Starting conversion...")
+
+    js_elem_rows = window.AppState.logic1.elemRows
+    if js_elem_rows is None:
+        log_status("[ERROR] Logic 1: No input data. Load an ACCDB or Universal CSV.")
+        return
+
+    try:
+        def _js_to_list(js_obj):
+            if js_obj is None: return None
+            return _js_rows_to_list_of_dicts(js_obj)
+        elem_rows = _js_to_list(js_elem_rows)
+        bend_rows = _js_to_list(window.AppState.logic1.bendRows)
+        rest_rows = _js_to_list(window.AppState.logic1.restRows)
+        rigid_rows = _js_to_list(window.AppState.logic1.rigidRows)
+        sif_rows = _js_to_list(window.AppState.logic1.sifRows)
+        log_status(f"Logic 1: {len(elem_rows)} elements loaded.")
+    except Exception as e:
+        log_status(f"[ERROR] Logic 1: Failed to read rows: {e}")
+        return
+
+    try:
+        exporter = L1_Exporter.from_tables(
+            elem_rows=elem_rows,
+            bend_rows=bend_rows,
+            rest_rows=rest_rows,
+            rigid_rows=rigid_rows,
+            sif_rows=sif_rows
+        )
+        cii_text = exporter.export()
+        _l1_parsed_data = cii_text  # store for intermediate export
+    except Exception as e:
+        log_status(f"[ERROR] Logic 1: Generation failed: {e}")
+        import traceback; log_status(traceback.format_exc())
+        return
+
+    raw_name = str(window.AppState.logic1.inputFilename or "output")
+    import re as _re
+    out_name = _re.sub(r'\.(accdb|mdb|csv)$', '', raw_name, flags=_re.IGNORECASE) + '_logic1.cii'
+    download_file(cii_text, out_name, "text/plain")
+    log_status(f"Logic 1: SUCCESS — Downloaded {out_name} ({len(cii_text)} bytes).")
+    el = document.getElementById("l1-status-processing")
+    if el: el.textContent = "Downloaded " + out_name
+
+
+async def on_l1_export_intermediate(event):
+    global _l1_parsed_data
+    log_status("Logic 1: Exporting intermediate CSV...")
+
+    js_elem_rows = window.AppState.logic1.elemRows
+    if js_elem_rows is None and _l1_parsed_data is None:
+        log_status("[ERROR] Logic 1: No data. Run Convert first.")
+        return
+
+    try:
+        from Logic1_importer import get_boilerplate_cii_data as L1_boilerplate
+        from Logic1_parser import CIIParser as L1_CIIParser, ParserSettings as L1_ParserSettings
+
+        if js_elem_rows is not None:
+            elem_rows = _js_rows_to_list_of_dicts(js_elem_rows)
+            df = pd.DataFrame(elem_rows)
+            # Build minimal parsed_data for exporter
+            parsed = L1_boilerplate()
+        else:
+            df = pd.DataFrame()
+            parsed = L1_boilerplate()
+
+        csv_str = df.to_csv(index=False)
+    except Exception as e:
+        log_status(f"[ERROR] Logic 1: Export failed: {e}")
+        return
+
+    out_name = "logic1_intermediate.csv"
+    download_file(csv_str, out_name, "text/csv")
+    log_status(f"Logic 1: Intermediate CSV exported — {len(df)} rows.")
+    el_s = document.getElementById("l1-status-intermediate")
+    if el_s: el_s.textContent = "Downloaded " + out_name
+
+    lines = csv_str.split('\n')
+    preview = '\n'.join(lines[:6])
+    pre_el = document.getElementById("l1-csv-preview")
+    if pre_el: pre_el.textContent = preview
+    cont = document.getElementById("l1-csv-preview-container")
+    if cont: cont.classList.remove("hidden")
+
+
+document.addEventListener("l1-convert", _cp(on_l1_convert))
+document.addEventListener("l1-export-intermediate", _cp(on_l1_export_intermediate))
+
+
+# ================================================================
+# Logic 4 PyScript handlers
+# ================================================================
+_l4_last_elem_df    = None
+_l4_last_bend_rows  = None
+_l4_last_rest_rows  = None
+_l4_last_rigid_rows = None
+_l4_last_sif_rows   = None
+
+async def on_l4_convert(event):
+    global _l4_last_elem_df, _l4_last_bend_rows, _l4_last_rest_rows, _l4_last_rigid_rows, _l4_last_sif_rows
+    log_status("Logic 4: Starting hybrid conversion...")
+
+    js_elem = window.AppState.logic4.elemRows
+    if js_elem is None:
+        log_status("[ERROR] Logic 4: No input data. Load an ACCDB or Universal CSV.")
+        return
+
+    try:
+        elem_list = _js_rows_to_list_of_dicts(js_elem)
+        elem_df = pd.DataFrame(elem_list)
+        log_status(f"Logic 4: {len(elem_df)} elements loaded.")
+    except Exception as e:
+        log_status(f"[ERROR] Logic 4: Failed to read element rows: {e}")
+        return
+
+    # Check if this is a universal CSV (has BND_ columns) — reconstruct aux from prefixed cols
+    is_universal_csv = 'BND_RADIUS' in elem_df.columns
+    bend_rows = rest_rows = rigid_rows = sif_rows = None
+
+    if is_universal_csv:
+        log_status("Logic 4: Universal CSV detected — reconstructing aux rows from BND_/RST_/RGD_/SIF_ columns...")
+        try:
+            loaded = L4_load_universal_csv(elem_df)
+            elem_df    = loaded['elem_df']
+            bend_rows  = loaded['bend_rows']
+            rest_rows  = loaded['rest_rows']
+            rigid_rows = loaded['rigid_rows']
+            sif_rows   = loaded['sif_rows']
+        except Exception as e:
+            log_status(f"[WARN] Logic 4: Universal CSV reconstruction failed: {e}. Continuing without aux rows.")
+    else:
+        # Read aux table rows from JS globals
+        def _js_to_list(js_obj):
+            if js_obj is None: return None
+            return _js_rows_to_list_of_dicts(js_obj)
+        bend_rows  = _js_to_list(window.AppState.logic4.bendRows)
+        rest_rows  = _js_to_list(window.AppState.logic4.restRows)
+        rigid_rows = _js_to_list(window.AppState.logic4.rigidRows)
+        sif_rows   = _js_to_list(window.AppState.logic4.sifRows)
+
+    # Cache for universal CSV export
+    _l4_last_elem_df    = elem_df
+    _l4_last_bend_rows  = bend_rows
+    _l4_last_rest_rows  = rest_rows
+    _l4_last_rigid_rows = rigid_rows
+    _l4_last_sif_rows   = sif_rows
+
+    # Parse optional base CII
+    base_data = None
+    js_cii_text = window.AppState.logic4.baseCiiText
+    if js_cii_text:
+        try:
+            from Logic2_parser import CIIParser as _L4Parser, ParserSettings as _L4PS
+            n1 = int(document.getElementById("l4-setting-n1").value or 2000)
+            p = _L4Parser(_L4PS(n1_base=n1, is_data_matrix=False))
+            base_data = p.parse_lines([l.rstrip('\r') for l in js_cii_text.split('\n')])
+            log_status(f"Logic 4: Base CII parsed — {len(base_data.get('elements', []))} elements.")
+        except Exception as e:
+            log_status(f"[WARN] Logic 4: Could not parse base CII ({e}). Using boilerplate.")
+
+    try:
+        use_crlf = document.getElementById("l4-setting-crlf").value == "true"
+        cii_text = L4_build_hybrid_cii(
+            elem_df=elem_df,
+            bend_rows=bend_rows,
+            rest_rows=rest_rows,
+            rigid_rows=rigid_rows,
+            sif_rows=sif_rows,
+            base_parsed_data=base_data,
+            use_dos_newlines=use_crlf
+        )
+    except Exception as e:
+        log_status(f"[ERROR] Logic 4: Hybrid CII generation failed: {e}")
+        import traceback; log_status(traceback.format_exc())
+        return
+
+    raw_name = str(window.AppState.logic4.inputFilename or "output")
+    import re as _re
+    out_name = _re.sub(r'\.(accdb|mdb|csv)$', '', raw_name, flags=_re.IGNORECASE) + '_logic4.cii'
+    download_file(cii_text, out_name, "text/plain")
+    log_status(f"Logic 4: SUCCESS — Downloaded {out_name} ({len(cii_text)} bytes).")
+    el = document.getElementById("l4-status-processing")
+    if el: el.textContent = "Downloaded " + out_name
+
+
+async def on_l4_export_intermediate(event):
+    global _l4_last_elem_df, _l4_last_bend_rows, _l4_last_rest_rows, _l4_last_rigid_rows, _l4_last_sif_rows
+    log_status("Logic 4: Exporting Universal CSV...")
+
+    if _l4_last_elem_df is None:
+        js_elem = window.AppState.logic4.elemRows
+        if js_elem is None:
+            log_status("[ERROR] Logic 4: No data. Load a file or run Convert first.")
+            return
+        elem_list = _js_rows_to_list_of_dicts(js_elem)
+        _l4_last_elem_df = pd.DataFrame(elem_list)
+
+        def _js_to_list(js_obj):
+            if js_obj is None: return None
+            return _js_rows_to_list_of_dicts(js_obj)
+        _l4_last_bend_rows  = _js_to_list(window.AppState.logic4.bendRows)
+        _l4_last_rest_rows  = _js_to_list(window.AppState.logic4.restRows)
+        _l4_last_rigid_rows = _js_to_list(window.AppState.logic4.rigidRows)
+        _l4_last_sif_rows   = _js_to_list(window.AppState.logic4.sifRows)
+
+    try:
+        univ_df = L4_build_universal_csv(
+            elem_df    = _l4_last_elem_df,
+            bend_rows  = _l4_last_bend_rows,
+            rest_rows  = _l4_last_rest_rows,
+            rigid_rows = _l4_last_rigid_rows,
+            sif_rows   = _l4_last_sif_rows
+        )
+        csv_str = univ_df.to_csv(index=False)
+    except Exception as e:
+        log_status(f"[ERROR] Logic 4: Universal CSV export failed: {e}")
+        import traceback; log_status(traceback.format_exc())
+        return
+
+    raw_name = str(window.AppState.logic4.inputFilename or "output")
+    import re as _re
+    out_name = _re.sub(r'\.(accdb|mdb|csv)$', '', raw_name, flags=_re.IGNORECASE) + '_universal.csv'
+    download_file(csv_str, out_name, "text/csv")
+    log_status(f"Logic 4: Universal CSV exported — {len(univ_df)} rows × {len(univ_df.columns)} columns.")
+    el_s = document.getElementById("l4-status-intermediate")
+    if el_s: el_s.textContent = f"Downloaded {out_name} ({len(univ_df.columns)} cols)"
+
+    lines = csv_str.split('\n')
+    preview = '\n'.join(lines[:6])
+    pre_el = document.getElementById("l4-csv-preview")
+    if pre_el: pre_el.textContent = preview
+    cont = document.getElementById("l4-csv-preview-container")
+    if cont: cont.classList.remove("hidden")
+
+
+document.addEventListener("l4-convert", _cp(on_l4_convert))
+document.addEventListener("l4-export-intermediate", _cp(on_l4_export_intermediate))
+
+# Bind CII Tools button events (app is already visible via JS DOMContentLoaded)
+btn_export = document.getElementById("btn-export-csv")
+btn_export.addEventListener("click", create_proxy(on_export_csv))
+
+btn_recon = document.getElementById("btn-reconstruct")
+btn_recon.addEventListener("click", create_proxy(on_reconstruct))
+
+btn_clear = document.getElementById("btn-clear-logs")
+btn_clear.addEventListener("click", create_proxy(clear_logs))
+
+# ================================================================
+# Per-Logic Python Debug Handlers
+# ================================================================
+
+async def on_l1_debug(event):
+    log_status("=== [L1 PYTHON DEBUG] ===")
+    js_rows = window.AppState.logic1.elemRows
+    log_status(f"inputFilename : {window.AppState.logic1.inputFilename}")
+    log_status(f"elemRows      : {'None' if js_rows is None else str(js_rows.length) + ' rows'}")
+    global _l1_parsed_data
+    log_status(f"_l1_parsed_data (CII text): {'None' if _l1_parsed_data is None else str(len(_l1_parsed_data)) + ' chars'}")
+    if js_rows is not None and js_rows.length > 0:
+        try:
+            rows = _js_rows_to_list_of_dicts(js_rows)
+            r = rows[0]
+            log_status(f"  Row 0 columns ({len(r)}): {', '.join(list(r.keys())[:10])}...")
+            for k in ['FROM_NODE','TO_NODE','DIAMETER','WALL_THICK','BEND_PTR','REST_PTR','RIGID_PTR','INT_PTR','MATERIAL_NUM']:
+                log_status(f"  {k:<20} = {r.get(k,'(missing)')}")
+        except Exception as e:
+            log_status(f"[ERROR] Row inspection failed: {e}")
+    log_status("=== [L1 PYTHON DEBUG END] ===")
+
+async def on_l2_debug(event):
+    log_status("=== [L2 PYTHON DEBUG] ===")
+    js_rows = window.AppState.logic2.tableRows
+    log_status(f"inputFilename : {window.AppState.logic2.inputFilename}")
+    log_status(f"tableRows     : {'None' if js_rows is None else str(js_rows.length) + ' rows'}")
+    cii_t = window.AppState.logic2.baseCiiText
+    log_status(f"baseCiiText   : {'None' if cii_t is None else str(len(cii_t)) + ' chars'}")
+    global _l2_parsed_data
+    if _l2_parsed_data is not None:
+        elems = _l2_parsed_data.get('elements', [])
+        ctrl  = _l2_parsed_data.get('control', {})
+        log_status(f"_l2_parsed_data: {len(elems)} elements, NUMELT={ctrl.get('NUMELT','?')}")
+        log_status(f"  Aux keys: {list(_l2_parsed_data.get('aux_data', {}).keys())}")
+    else:
+        log_status("_l2_parsed_data: None (run Convert first)")
+    if js_rows is not None and js_rows.length > 0:
+        try:
+            df = _l2_js_rows_to_df(js_rows)
+            if df is not None:
+                log_status(f"  DataFrame shape: {df.shape}")
+                log_status(f"  Columns[:10]: {', '.join(list(df.columns)[:10])}")
+                for k in ['FROM_NODE','TO_NODE','BEND_PTR','REST_PTR','RIGID_PTR','INT_PTR']:
+                    if k in df.columns:
+                        log_status(f"  {k:<18} row[0] = {df[k].iloc[0]}")
+                    else:
+                        log_status(f"  {k:<18} MISSING from DataFrame")
+        except Exception as e:
+            log_status(f"[ERROR] DataFrame inspection failed: {e}")
+    log_status("=== [L2 PYTHON DEBUG END] ===")
+
+async def on_l4_debug(event):
+    log_status("=== [L4 PYTHON DEBUG] ===")
+    js_elem = window.AppState.logic4.elemRows
+    log_status(f"inputFilename : {window.AppState.logic4.inputFilename}")
+    log_status(f"elemRows      : {'None' if js_elem is None else str(js_elem.length) + ' rows'}")
+    log_status(f"bendRows      : {'None' if window.AppState.logic4.bendRows  is None else str(window.AppState.logic4.bendRows.length)  + ' rows'}")
+    log_status(f"restRows      : {'None' if window.AppState.logic4.restRows  is None else str(window.AppState.logic4.restRows.length)  + ' rows'}")
+    log_status(f"rigidRows     : {'None' if window.AppState.logic4.rigidRows is None else str(window.AppState.logic4.rigidRows.length) + ' rows'}")
+    log_status(f"sifRows       : {'None' if window.AppState.logic4.sifRows   is None else str(window.AppState.logic4.sifRows.length)   + ' rows'}")
+    global _l4_last_elem_df, _l4_last_bend_rows, _l4_last_rest_rows, _l4_last_rigid_rows, _l4_last_sif_rows
+    if _l4_last_elem_df is not None:
+        import pandas as _pd
+        log_status(f"_l4_last_elem_df: shape={_l4_last_elem_df.shape}")
+        is_univ = 'BND_RADIUS' in _l4_last_elem_df.columns
+        log_status(f"  Universal CSV (has BND_RADIUS): {is_univ}")
+        log_status(f"  Columns[:8]: {list(_l4_last_elem_df.columns)[:8]}")
+    else:
+        log_status("_l4_last_elem_df: None (run Convert first)")
+    log_status(f"_l4_last_bend_rows : {len(_l4_last_bend_rows  or [])}")
+    log_status(f"_l4_last_rest_rows : {len(_l4_last_rest_rows  or [])}")
+    log_status(f"_l4_last_rigid_rows: {len(_l4_last_rigid_rows or [])}")
+    log_status(f"_l4_last_sif_rows  : {len(_l4_last_sif_rows   or [])}")
+    if js_elem is not None and js_elem.length > 0:
+        try:
+            import pandas as _pd2
+            df = _pd2.DataFrame(_js_rows_to_list_of_dicts(js_elem))
+            is_univ = 'BND_RADIUS' in df.columns
+            log_status(f"  Live elem_df: {df.shape}, Universal={is_univ}")
+            for k in ['FROM_NODE','TO_NODE','BEND_PTR','REST_PTR','RIGID_PTR','INT_PTR']:
+                if k in df.columns:
+                    log_status(f"  {k:<18} row[0] = {df[k].iloc[0]}")
+        except Exception as e:
+            log_status(f"[ERROR] {e}")
+    log_status("=== [L4 PYTHON DEBUG END] ===")
+
+async def on_cii_tools_debug(event):
+    log_status("=== [CII TOOLS PYTHON DEBUG] ===")
+    global original_parsed_data, current_cii_filename
+    log_status(f"current_cii_filename: {current_cii_filename}")
+    if original_parsed_data is not None:
+        elems = original_parsed_data.get('elements', [])
+        ctrl  = original_parsed_data.get('control', {})
+        ver   = original_parsed_data.get('version', {})
+        log_status(f"Elements: {len(elems)}")
+        log_status(f"NUMELT: {ctrl.get('NUMELT','?')}, GVERSION: {ver.get('GVERSION','?')}")
+        log_status(f"Aux keys: {list(original_parsed_data.get('aux_data', {}).keys())}")
+        if elems:
+            el0 = elems[0]
+            log_status(f"Element 0: FROM={el0['REL'][0]}, TO={el0['REL'][1]}, DIAM={el0['REL'][5]}")
+            log_status(f"  IEL[0:6] = {el0.get('IEL',[])[:6]}")
+    else:
+        log_status("original_parsed_data: None (upload and parse a .CII file first)")
+    log_status("=== [CII TOOLS PYTHON DEBUG END] ===")
+
+document.addEventListener("l1-debug",  _cp(on_l1_debug))
+document.addEventListener("l2-debug",  _cp(on_l2_debug))
+document.addEventListener("l4-debug",  _cp(on_l4_debug))
+document.addEventListener("cii-debug", _cp(on_cii_tools_debug))
+
+log_status("Python environment ready. CII Tools active.")
+</script>
+</body>
+</html>

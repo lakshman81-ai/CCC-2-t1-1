@@ -1,0 +1,15 @@
+<<<<<<< SEARCH
+        // Sync dropdown if it's a logic tab
+        const dd = document.getElementById('logic-dropdown');
+=======
+        // Sync dropdown if it's a logic tab
+        const dd = document.getElementById('logic-dropdown');
+        if (dd && ['logic1', 'logic2', 'logic3', 'logic4'].includes(logicKey)) {
+            dd.value = logicKey;
+        }
+
+        // Logic 5 (Access to CSV) logic - reset UI
+        if (logicKey === 'accdb-tools') {
+            resetAccdbUI();
+        }
+>>>>>>> REPLACE

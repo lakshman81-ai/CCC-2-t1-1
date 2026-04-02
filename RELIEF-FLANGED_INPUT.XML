@@ -1,0 +1,2 @@
+# If they asked for a "full code in zip in /app", I need to create the zip file `/app/caesarii_csv_accdb_to_cii.zip` using the files from `CII_formatter_M_P3_2` AND my Python Flask server files (`app.py`, `full_exporter_final.py`, `config.py`, `template.csv`).
+# The easiest way is to overwrite their `index.html` with my simple Flask interface that does the parsing server-side instead of in-browser.

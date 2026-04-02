@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -E \"^\\\\s+\"\"#$\" /c/Code/CII_formatter_M_P3-main/benchmark_data.js)",
+      "Bash(grep -v '\\\\\\\\n')",
+      "Bash(grep -v \"\\\\.py$\")",
+      "Bash(grep -E '^\\\\s+\"\"\"\"#\\\\$|^\\\\s+\"\"\"\"[A-Z]+\"\"\"\"\\\\s*:' /c/Code/CII_formatter_M_P3-main/benchmark_data.js)",
+      "Bash(sed -n '1,2p' /c/Code/CII_formatter_M_P3-main/benchmark_data.js)",
+      "Bash(sed -n '1,500p' /c/Code/CII_formatter_M_P3-main/benchmark_data.js)",
+      "Bash(grep -h INPUT_ /c/Code/CII_formatter_M_P3-main/*.py /c/Code/CII_formatter_M_P3-main/*.js)",
+      "Bash(wc -l /c/Code/CII_formatter_M_P3-main/*.py)",
+      "Bash(ls -la /c/Code/CII_formatter_M_P3-main/*.py)",
+      "Bash(file /c/Code/CII_formatter_M_P3-main/*.py)",
+      "Bash(python3 -c \"import sys; sys.path.insert\\(0, ''/c/Code/CII_formatter_M_P3-main''\\); from Logic2_parser import CIIParser, ParserSettings; print\\(''Logic2_parser OK''\\)\")",
+      "Bash(python3 -c \"import sys; sys.path.insert\\(0, ''/c/Code/CII_formatter_M_P3-main''\\); from Logic2_serializer import CIISerializer, SerializerSettings; print\\(''Logic2_serializer OK''\\)\")",
+      "Bash(python3 -c \"import sys; sys.path.insert\\(0, ''/c/Code/CII_formatter_M_P3-main''\\); from Logic2_importer import reconstruct_from_csv; print\\(''Logic2_importer OK''\\)\")",
+      "Bash(python3 -c \"import sys; sys.path.insert\\(0, ''/c/Code/CII_formatter_M_P3-main''\\); from Logic2_exporter import generate_custom_csv; print\\(''Logic2_exporter OK''\\)\")",
+      "Bash(grep -E \"\\\\.\\(js|html\\)$\")",
+      "Bash(ls -la /c/Code/CII_formatter_M_P3-main/*.cii)"
+    ]
+  }
+}

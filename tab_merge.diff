@@ -1,0 +1,23 @@
+<<<<<<< SEARCH
+                    <button class="main-tab-btn flex-1 py-3 text-sm font-medium text-gray-500 hover:text-blue-600 focus:outline-none border-b-2 border-transparent transition-colors duration-200"
+                    onclick="switchMainTab('tab-logic4')">Logic 4 &#9889;</button>
+                </nav>
+            </div>
+        </div>
+
+        <!-- ========================================================= -->
+        <!-- Tab Content Containers -->
+        <!-- ========================================================= -->
+=======
+                    <button class="main-tab-btn flex-1 py-3 text-sm font-medium text-gray-500 hover:text-blue-600 focus:outline-none border-b-2 border-transparent transition-colors duration-200"
+                    onclick="switchMainTab('tab-logic4')">Logic 4 &#9889;</button>
+                    <button class="main-tab-btn flex-1 py-3 text-sm font-medium text-gray-500 hover:text-blue-600 focus:outline-none border-b-2 border-transparent transition-colors duration-200"
+                    onclick="switchMainTab('tab-tools')">Tools &#128722;</button>
+                </nav>
+            </div>
+        </div>
+
+        <!-- ========================================================= -->
+        <!-- Tab Content Containers -->
+        <!-- ========================================================= -->
+>>>>>>> REPLACE

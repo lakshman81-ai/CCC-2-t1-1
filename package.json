@@ -1,0 +1,11 @@
+{
+  "dependencies": {
+    "@regrapes/access-db-parser": "^2.0.2",
+    "buffer": "^6.0.3",
+    "process": "^0.11.10",
+    "util": "^0.12.5"
+  },
+  "devDependencies": {
+    "webpack-cli": "^7.0.2"
+  }
+}
