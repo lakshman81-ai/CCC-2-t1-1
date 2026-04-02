@@ -176,6 +176,7 @@ class CIIParser:
 
     def _parse_version(self, ctx: ParseContext):
         header = ctx.consume()
+        self.parsed_data["version"] = {"version_header_raw": header}
         if not ctx.has_more(): return
 
         line1 = ctx.consume()
@@ -205,6 +206,9 @@ class CIIParser:
 
     def _parse_control(self, ctx: ParseContext):
         header = ctx.consume()
+        if "control" not in self.parsed_data:
+            self.parsed_data["control"] = {}
+        self.parsed_data["control"]["control_header_raw"] = header
         if not ctx.has_more(): return
 
         line1 = ctx.consume()
@@ -329,6 +333,7 @@ class CIIParser:
 
     def _parse_units(self, ctx: ParseContext):
         header = ctx.consume()
+        self.parsed_data["units_header_raw"] = header
         records = []
         while ctx.has_more() and not ctx.peek().startswith("#$"):
             records.append(ctx.consume())
@@ -336,6 +341,7 @@ class CIIParser:
 
     def _parse_coords(self, ctx: ParseContext):
         header = ctx.consume()
+        self.parsed_data["coords_header_raw"] = header
         if not ctx.has_more(): return
 
         line1 = ctx.consume()
