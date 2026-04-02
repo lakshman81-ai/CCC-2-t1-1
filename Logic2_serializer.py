@@ -37,8 +37,12 @@ class CIISerializer:
 
         # #$ VERSION
         if "version" in data:
-            self._add_line("#$ VERSION ")
             v = data["version"]
+            # To preserve exact spacing if original didn't have space
+            if "version_header_raw" in v:
+                self._add_line(v["version_header_raw"])
+            else:
+                self._add_line("#$ VERSION")
             if "GVERSION_RAW" in v and "RVERSION_RAW" in v and "ICODEPAGE_RAW" in v:
                 self._add_line(f"  {v['GVERSION_RAW']}{v['RVERSION_RAW']}{v['ICODEPAGE_RAW']}")
             elif "GVERSION_RAW" in v and "RVERSION_RAW" not in v:
@@ -58,8 +62,11 @@ class CIISerializer:
 
         # #$ CONTROL
         if "control" in data:
-            self._add_line("#$ CONTROL ")
             c = data["control"]
+            if "control_header_raw" in c:
+                self._add_line(c["control_header_raw"])
+            else:
+                self._add_line("#$ CONTROL")
 
             if "counts_raw" in c and c["counts_raw"]:
                 if isinstance(c["counts_raw"], list) and len(c["counts_raw"]) > 0:
@@ -133,7 +140,19 @@ class CIISerializer:
                     else:
                         s = strs[i]
                         s_len = len(s)
-                        self._add_line(f"       {s_len:5d} {s}")
+                        if s_len == 0:
+                            if "           0" in el.get("STR_RAW", []):
+                                self._add_line("           0")
+                            elif "           0 " in el.get("STR_RAW", []):
+                                self._add_line("           0 ")
+                            else:
+                                raw_str = el["STR_RAW"][i] if i < len(el.get("STR_RAW", [])) else ""
+                                if raw_str and not s:
+                                    self._add_line(raw_line if raw_line else raw_str)
+                                else:
+                                    self._add_line("           0")
+                        else:
+                            self._add_line(f"       {s_len:5d} {s}")
 
                 color_raw = el.get("COLOR_RAW", [])
                 if color_raw and isinstance(color_raw, list) and len(color_raw) > 0 and color_raw[0]:
@@ -182,13 +201,19 @@ class CIISerializer:
 
         # #$ UNITS
         if "units" in data:
-            self._add_line("#$ UNITS   ")
+            if "units_header_raw" in data:
+                self._add_line(data["units_header_raw"])
+            else:
+                self._add_line("#$ UNITS")
             for line in data["units"]:
                 self._add_line(line)
 
         # #$ COORDS
         if "coords" in data and len(data["coords"]) > 0:
-            self._add_line("#$ COORDS  ")
+            if "coords_header_raw" in data:
+                self._add_line(data["coords_header_raw"])
+            else:
+                self._add_line("#$ COORDS")
 
             if "coords_raw_count" in data:
                 self._add_line(data["coords_raw_count"])
